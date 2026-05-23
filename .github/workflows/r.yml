@@ -295,13 +295,22 @@ jobs:
           project.root_object.package_references.clear
           project.targets.each do |target|
             target.package_product_dependencies.clear
-            frames = target.frameworks_build_phase
-            next unless frames
-            frames.files.each do |f|
-              next unless f.display_name
-              if f.file_ref && f.file_ref.respond_to?(:product_ref) && f.file_ref.product_ref
+            target.dependencies.to_a.each do |dep|
+              if dep.respond_to?(:product_ref) && dep.product_ref
+                dep.remove_from_project
+              end
+            end
+            bp = target.frameworks_build_phase
+            next unless bp
+            bp.files.to_a.each do |f|
+              if f.respond_to?(:product_ref) && f.product_ref
                 f.remove_from_project
               end
+            end
+          end
+          project.main_group.recursive_children.each do |child|
+            if child.respond_to?(:path) && child.path.to_s.include?("CapApp-SPM")
+              child.remove_from_project rescue nil
             end
           end
           project.save
