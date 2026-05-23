@@ -274,13 +274,39 @@ jobs:
           if [ "$TARGET" == "all_devices" ] || [ "$TARGET" == "macos_only" ]; then
             NEEDS_CATALYST="true"
           fi
+          USE_COCOAPODS="false"
           if [ "$CAP_MAJOR" -ge 8 ] && [ "$NEEDS_CATALYST" == "true" ]; then
+            USE_COCOAPODS="true"
             if [ ! -d "ios" ]; then npx cap add ios --packagemanager cocoapods 2>/dev/null || npx cap add ios; fi
             npx cap sync ios --packagemanager cocoapods 2>/dev/null || npx cap sync ios
           else
             if [ ! -d "ios" ]; then npx cap add ios; fi
             npx cap sync ios
           fi
+          echo "USE_COCOAPODS=$USE_COCOAPODS" >> $GITHUB_ENV
+      
+      - name: SPM Clean
+        if: env.USE_COCOAPODS == 'true'
+        working-directory: app/ios/App
+        run: |
+          ruby -e '
+          require "xcodeproj"
+          project = Xcodeproj::Project.open("App.xcodeproj")
+          project.root_object.package_references.clear
+          project.targets.each do |target|
+            target.package_product_dependencies.clear
+            frames = target.frameworks_build_phase
+            next unless frames
+            frames.files.each do |f|
+              next unless f.display_name
+              if f.file_ref && f.file_ref.respond_to?(:product_ref) && f.file_ref.product_ref
+                f.remove_from_project
+              end
+            end
+          end
+          project.save
+          '
+          rm -rf CapApp-SPM
       
       - name: AdMob
         working-directory: app
@@ -461,11 +487,6 @@ jobs:
       
       - name: Cert
         id: cert
-        env:
-          CERTIFICATE_BASE64: ${{ steps.apple.outputs.certificate_base64 }}
-          CERTIFICATE_PASSWORD: ${{ steps.apple.outputs.certificate_password }}
-          INSTALLER_CERT_BASE64: ${{ steps.apple.outputs.installer_certificate_base64 }}
-          INSTALLER_CERT_PASSWORD: ${{ steps.apple.outputs.installer_certificate_password }}
         run: |
           CERT_PATH=$RUNNER_TEMP/cert.p12
           INSTALLER_CERT_PATH=$RUNNER_TEMP/installer_cert.p12
@@ -473,17 +494,18 @@ jobs:
           KEYCHAIN_PASSWORD=$(openssl rand -base64 32)
           echo "::add-mask::$KEYCHAIN_PASSWORD"
           
-          echo "$CERTIFICATE_BASE64" | base64 --decode > $CERT_PATH
+          echo "${{ steps.apple.outputs.certificate_base64 }}" | base64 --decode > $CERT_PATH
           
           security create-keychain -p "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
           security set-keychain-settings -lut 21600 $KEYCHAIN_PATH
           security unlock-keychain -p "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
-          security import $CERT_PATH -P "$CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k $KEYCHAIN_PATH
+          security import $CERT_PATH -P "${{ steps.apple.outputs.certificate_password }}" -A -t cert -f pkcs12 -k $KEYCHAIN_PATH
           
           INSTALLER_CERT_NAME=""
-          if [ -n "$INSTALLER_CERT_BASE64" ]; then
-            echo "$INSTALLER_CERT_BASE64" | base64 --decode > $INSTALLER_CERT_PATH
-            security import $INSTALLER_CERT_PATH -P "$INSTALLER_CERT_PASSWORD" -A -t cert -f pkcs12 -k $KEYCHAIN_PATH
+          INST_B64="${{ steps.apple.outputs.installer_certificate_base64 }}"
+          if [ -n "$INST_B64" ]; then
+            echo "$INST_B64" | base64 --decode > $INSTALLER_CERT_PATH
+            security import $INSTALLER_CERT_PATH -P "${{ steps.apple.outputs.installer_certificate_password }}" -A -t cert -f pkcs12 -k $KEYCHAIN_PATH
             INSTALLER_CERT_NAME=$(security find-identity -v -p basic $KEYCHAIN_PATH | grep "3rd Party Mac Developer Installer" | head -1 | sed 's/.*"\(.*\)".*/\1/')
             if [ -n "$INSTALLER_CERT_NAME" ]; then
               echo "::add-mask::$INSTALLER_CERT_NAME"
@@ -637,6 +659,7 @@ jobs:
       - name: Build App
         working-directory: app/ios/App
         run: |
+          set -o pipefail
           if [ -d "App.xcworkspace" ]; then
             XC_ARG="-workspace App.xcworkspace"
             FL_ARG="workspace:App.xcworkspace"
@@ -654,7 +677,8 @@ jobs:
                 -scheme App -configuration Release \
                 -destination "generic/platform=iOS Simulator" \
                 -derivedDataPath build-simulator \
-                CODE_SIGN_IDENTITY="-" CODE_SIGNING_REQUIRED=NO CODE_SIGNING_ALLOWED=NO
+                CODE_SIGN_IDENTITY="-" CODE_SIGNING_REQUIRED=NO CODE_SIGNING_ALLOWED=NO \
+                2>&1 | tee build-ios.log
               
               APP_PATH=$(find build-simulator -name "*.app" -type d | head -1)
               cp -R "$APP_PATH" "./${APP_NAME_SAFE}-iOS-Simulator.app"
@@ -664,7 +688,8 @@ jobs:
                 -scheme App -configuration Release \
                 -destination "generic/platform=macOS,variant=Mac Catalyst" \
                 -derivedDataPath build-macos \
-                SUPPORTS_MACCATALYST=YES CODE_SIGN_IDENTITY="-" CODE_SIGNING_REQUIRED=NO CODE_SIGNING_ALLOWED=YES
+                SUPPORTS_MACCATALYST=YES CODE_SIGN_IDENTITY="-" CODE_SIGNING_REQUIRED=NO CODE_SIGNING_ALLOWED=YES \
+                2>&1 | tee build-mac.log
               
               APP_PATH=$(find build-macos -name "*.app" -type d | head -1)
               find "$APP_PATH/Contents/Frameworks" -name "*.framework" -maxdepth 1 | while read fw; do
@@ -684,7 +709,8 @@ jobs:
                 -destination "$DESTINATION" \
                 -derivedDataPath build \
                 SUPPORTS_MACCATALYST=YES DEVELOPMENT_TEAM="$TEAM_ID" \
-                CODE_SIGN_IDENTITY="$CODE_SIGN_IDENTITY" CODE_SIGNING_REQUIRED="$CODE_SIGNING_REQUIRED" CODE_SIGNING_ALLOWED="YES"
+                CODE_SIGN_IDENTITY="$CODE_SIGN_IDENTITY" CODE_SIGNING_REQUIRED="$CODE_SIGNING_REQUIRED" CODE_SIGNING_ALLOWED="YES" \
+                2>&1 | tee build.log
               
               APP_PATH=$(find build -name "*.app" -type d | head -1)
               if [ "${{ inputs.build_mode }}" == "build_only" ]; then
@@ -705,7 +731,8 @@ jobs:
                 -destination "$DESTINATION" \
                 -derivedDataPath build \
                 DEVELOPMENT_TEAM="$TEAM_ID" CODE_SIGN_IDENTITY="$CODE_SIGN_IDENTITY" \
-                CODE_SIGNING_REQUIRED="$CODE_SIGNING_REQUIRED" CODE_SIGNING_ALLOWED="$CODE_SIGNING_ALLOWED"
+                CODE_SIGNING_REQUIRED="$CODE_SIGNING_REQUIRED" CODE_SIGNING_ALLOWED="$CODE_SIGNING_ALLOWED" \
+                2>&1 | tee build.log
               
               APP_PATH=$(find build -name "*.app" -type d | head -1)
               cp -R "$APP_PATH" "./${APP_NAME_SAFE}.app"
@@ -856,8 +883,8 @@ jobs:
           for DIR in $SEARCH_DIRS; do
             find $DIR -name "*.log" -o -name "*.txt" 2>/dev/null | head -30 | while read f; do
               grep -iHn "error:" "$f" 2>/dev/null | grep -v "warning:" | tail -30 >> "$ERROR_FILE" || true
-              grep -iHn -E "(fatal|undefined symbol|linker|ld: |clang:|no library for this platform)" "$f" 2>/dev/null | tail -20 >> "$ERROR_FILE" || true
-              grep -iHn -E "(cannot find|no such module|no library|xcframework)" "$f" 2>/dev/null | tail -20 >> "$ERROR_FILE" || true
+              grep -iHn -E "(fatal|undefined symbol|linker|ld: |clang:|no library for this platform|Multiple commands produce|BUILD FAILED)" "$f" 2>/dev/null | tail -20 >> "$ERROR_FILE" || true
+              grep -iHn -E "(cannot find|no such module|no library|xcframework|duplicate output)" "$f" 2>/dev/null | tail -20 >> "$ERROR_FILE" || true
               grep -iHn -E "(provisioning|signing|codesign|entitlement|CSSMERR)" "$f" 2>/dev/null | grep -i "error\|fail\|invalid\|no " | tail -15 >> "$ERROR_FILE" || true
             done
           done
