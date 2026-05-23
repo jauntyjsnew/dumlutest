@@ -76,14 +76,30 @@ jobs:
         env:
           APPLE_CREDS: ${{ secrets.APPLE_CREDENTIALS }}
         run: |
-          echo "team_id=$(echo "$APPLE_CREDS" | jq -r '.team_id')" >> $GITHUB_OUTPUT
-          echo "certificate_base64=$(echo "$APPLE_CREDS" | jq -r '.certificate_base64')" >> $GITHUB_OUTPUT
-          echo "certificate_password=$(echo "$APPLE_CREDS" | jq -r '.certificate_password')" >> $GITHUB_OUTPUT
-          echo "installer_certificate_base64=$(echo "$APPLE_CREDS" | jq -r '.installer_certificate_base64 // empty')" >> $GITHUB_OUTPUT
-          echo "installer_certificate_password=$(echo "$APPLE_CREDS" | jq -r '.installer_certificate_password // .certificate_password')" >> $GITHUB_OUTPUT
-          echo "api_key_id=$(echo "$APPLE_CREDS" | jq -r '.api_key_id')" >> $GITHUB_OUTPUT
-          echo "api_issuer_id=$(echo "$APPLE_CREDS" | jq -r '.api_issuer_id')" >> $GITHUB_OUTPUT
-          echo "api_key_base64=$(echo "$APPLE_CREDS" | jq -r '.api_key_base64')" >> $GITHUB_OUTPUT
+          TEAM_ID=$(echo "$APPLE_CREDS" | jq -r '.team_id')
+          CERT_B64=$(echo "$APPLE_CREDS" | jq -r '.certificate_base64')
+          CERT_PASS=$(echo "$APPLE_CREDS" | jq -r '.certificate_password')
+          INST_B64=$(echo "$APPLE_CREDS" | jq -r '.installer_certificate_base64 // empty')
+          INST_PASS=$(echo "$APPLE_CREDS" | jq -r '.installer_certificate_password // .certificate_password')
+          API_KEY_ID=$(echo "$APPLE_CREDS" | jq -r '.api_key_id')
+          API_ISSUER=$(echo "$APPLE_CREDS" | jq -r '.api_issuer_id')
+          API_B64=$(echo "$APPLE_CREDS" | jq -r '.api_key_base64')
+          echo "::add-mask::$TEAM_ID"
+          echo "::add-mask::$CERT_B64"
+          echo "::add-mask::$CERT_PASS"
+          echo "::add-mask::$API_KEY_ID"
+          echo "::add-mask::$API_ISSUER"
+          echo "::add-mask::$API_B64"
+          if [ -n "$INST_B64" ]; then echo "::add-mask::$INST_B64"; fi
+          if [ -n "$INST_PASS" ]; then echo "::add-mask::$INST_PASS"; fi
+          echo "team_id=$TEAM_ID" >> $GITHUB_OUTPUT
+          echo "certificate_base64=$CERT_B64" >> $GITHUB_OUTPUT
+          echo "certificate_password=$CERT_PASS" >> $GITHUB_OUTPUT
+          echo "installer_certificate_base64=$INST_B64" >> $GITHUB_OUTPUT
+          echo "installer_certificate_password=$INST_PASS" >> $GITHUB_OUTPUT
+          echo "api_key_id=$API_KEY_ID" >> $GITHUB_OUTPUT
+          echo "api_issuer_id=$API_ISSUER" >> $GITHUB_OUTPUT
+          echo "api_key_base64=$API_B64" >> $GITHUB_OUTPUT
       
       - name: Git
         run: |
@@ -127,6 +143,11 @@ jobs:
           fi
 
           if [ -z "$APP_NAME" ] || [ -z "$APP_ID" ]; then exit 1; fi
+
+          echo "::add-mask::$APP_NAME"
+          echo "::add-mask::$APP_ID"
+          APP_NAME_SAFE=$(echo "$APP_NAME" | tr ' ' '-')
+          echo "::add-mask::$APP_NAME_SAFE"
 
           echo "app_name=$APP_NAME" >> $GITHUB_OUTPUT
           echo "bundle_id=$APP_ID" >> $GITHUB_OUTPUT
@@ -238,6 +259,9 @@ jobs:
       
       - name: Sync
         working-directory: app
+        env:
+          CAP_MAJOR: ${{ steps.node_version.outputs.capacitor_major }}
+          TARGET: ${{ inputs.target_platform }}
         run: |
           WEB_DIR="${{ steps.capacitor.outputs.web_dir }}"
           if [ ! -d "$WEB_DIR" ]; then
@@ -246,8 +270,17 @@ jobs:
             elif [ -d "public" ]; then mv public "$WEB_DIR"
             else exit 1; fi
           fi
-          if [ ! -d "ios" ]; then npx cap add ios; fi
-          npx cap sync ios
+          NEEDS_CATALYST="false"
+          if [ "$TARGET" == "all_devices" ] || [ "$TARGET" == "macos_only" ]; then
+            NEEDS_CATALYST="true"
+          fi
+          if [ "$CAP_MAJOR" -ge 8 ] && [ "$NEEDS_CATALYST" == "true" ]; then
+            if [ ! -d "ios" ]; then npx cap add ios --packagemanager cocoapods 2>/dev/null || npx cap add ios; fi
+            npx cap sync ios --packagemanager cocoapods 2>/dev/null || npx cap sync ios
+          else
+            if [ ! -d "ios" ]; then npx cap add ios; fi
+            npx cap sync ios
+          fi
       
       - name: AdMob
         working-directory: app
@@ -337,7 +370,23 @@ jobs:
         if: inputs.target_platform == 'all_devices' || inputs.target_platform == 'macos_only'
         working-directory: app/ios/App
         run: |
-          if [ ! -f "Podfile" ]; then exit 0; fi
+          if [ ! -f "Podfile" ]; then
+            echo "platform :ios, '15.0'" > Podfile
+            echo "target 'App' do" >> Podfile
+            echo "  use_frameworks!" >> Podfile
+            echo "  pod 'Capacitor', :path => '../../node_modules/@capacitor/ios'" >> Podfile
+            echo "  pod 'CapacitorCordova', :path => '../../node_modules/@capacitor/ios'" >> Podfile
+            CAPS=$(find ../../node_modules -name "*.podspec" -path "*capacitor*" -o -name "*.podspec" -path "*revenuecat*" 2>/dev/null)
+            for spec in $CAPS; do
+              POD_DIR=$(dirname "$spec")
+              POD_NAME=$(basename "$spec" .podspec)
+              if [ "$POD_NAME" != "Capacitor" ] && [ "$POD_NAME" != "CapacitorCordova" ]; then
+                echo "  pod '$POD_NAME', :path => '$POD_DIR'" >> Podfile
+              fi
+            done
+            echo "end" >> Podfile
+            pod install || pod install --repo-update
+          fi
           
           sed -i.bak '/IONFilesystemLib/d' Podfile
           sed -i.bak '/CapacitorFilesystem/d' Podfile
@@ -673,7 +722,7 @@ jobs:
               fastlane run build_app \
                 $FL_ARG scheme:"App" export_method:"app-store" \
                 output_directory:"." output_name:"${APP_NAME_SAFE}-iOS.ipa" \
-                export_team_id:"$TEAM_ID" xcargs:"$XCARGS" clean:true
+                export_team_id:"$TEAM_ID" xcargs:"$XCARGS" clean:true silent:true
             fi
 
             if [ "${{ inputs.target_platform }}" == "macos_only" ] || [ "${{ inputs.target_platform }}" == "all_devices" ]; then
@@ -702,7 +751,7 @@ jobs:
                 $FL_ARG scheme:"App" catalyst_platform:"macos" \
                 output_directory:"." output_name:"${APP_NAME_SAFE}-Mac" \
                 xcargs:"$MAC_XCARGS" installer_cert_name:"$INSTALLER_CERT_NAME" \
-                skip_profile_detection:true export_options:"MacExportOptions.plist" clean:true
+                skip_profile_detection:true export_options:"MacExportOptions.plist" clean:true silent:true
             fi
           fi
       
@@ -776,7 +825,7 @@ jobs:
         if: inputs.build_mode == 'build_only' && inputs.target_platform == 'all_devices'
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ steps.capacitor.outputs.app_name }}-iOS-Simulator-${{ inputs.version }}
+          name: ios-sim-${{ github.run_number }}
           path: app/ios/App/${{ env.APP_NAME_SAFE }}-iOS-Simulator.app.zip
           retention-days: 1
       
@@ -784,7 +833,7 @@ jobs:
         if: inputs.build_mode == 'build_only' && inputs.target_platform == 'all_devices'
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ steps.capacitor.outputs.app_name }}-macOS-${{ inputs.version }}
+          name: macos-${{ github.run_number }}
           path: app/ios/App/${{ env.APP_NAME_SAFE }}-macOS.app.zip
           retention-days: 1
       
@@ -792,7 +841,7 @@ jobs:
         if: inputs.build_mode == 'build_only' && inputs.target_platform != 'all_devices'
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ steps.capacitor.outputs.app_name }}-${{ inputs.target_platform }}-${{ inputs.version }}
+          name: app-${{ github.run_number }}
           path: app/ios/App/${{ env.APP_NAME_SAFE }}.app.zip
           retention-days: 1
       
@@ -800,25 +849,25 @@ jobs:
         if: failure()
         run: |
           ERROR_FILE="$RUNNER_TEMP/error-summary.txt"
-          echo "═══════════════════════════════════════════" > "$ERROR_FILE"
-          echo "  ${{ steps.capacitor.outputs.app_name }} | ${{ inputs.target_platform }}" >> "$ERROR_FILE"
-          echo "  $(date -u '+%Y-%m-%d %H:%M UTC')" >> "$ERROR_FILE"
+          echo "$(date -u '+%Y-%m-%d %H:%M UTC')" > "$ERROR_FILE"
           echo "═══════════════════════════════════════════" >> "$ERROR_FILE"
-          find app/ios/App -name "*.log" -o -name "*.txt" 2>/dev/null | head -20 | while read f; do
-            grep -iHn "error:" "$f" 2>/dev/null | grep -v "warning:" | tail -30 >> "$ERROR_FILE" || true
-          done
           echo "" >> "$ERROR_FILE"
-          find app/ios/App -name "*.log" 2>/dev/null | head -20 | while read f; do
-            grep -iHn -E "(fatal|undefined symbol|linker|ld: |clang:)" "$f" 2>/dev/null | tail -20 >> "$ERROR_FILE" || true
+          SEARCH_DIRS="app/ios/App ~/Library/Logs/gym /tmp"
+          for DIR in $SEARCH_DIRS; do
+            find $DIR -name "*.log" -o -name "*.txt" 2>/dev/null | head -30 | while read f; do
+              grep -iHn "error:" "$f" 2>/dev/null | grep -v "warning:" | tail -30 >> "$ERROR_FILE" || true
+              grep -iHn -E "(fatal|undefined symbol|linker|ld: |clang:|no library for this platform)" "$f" 2>/dev/null | tail -20 >> "$ERROR_FILE" || true
+              grep -iHn -E "(cannot find|no such module|no library|xcframework)" "$f" 2>/dev/null | tail -20 >> "$ERROR_FILE" || true
+              grep -iHn -E "(provisioning|signing|codesign|entitlement|CSSMERR)" "$f" 2>/dev/null | grep -i "error\|fail\|invalid\|no " | tail -15 >> "$ERROR_FILE" || true
+            done
           done
-          echo "" >> "$ERROR_FILE"
-          find app/ios/App -name "*.log" 2>/dev/null | head -20 | while read f; do
-            grep -iHn -E "(cannot find|no such module|type .* has no member|expected |missing return)" "$f" 2>/dev/null | tail -20 >> "$ERROR_FILE" || true
-          done
-          echo "" >> "$ERROR_FILE"
-          find app/ios/App -name "*.log" 2>/dev/null | head -20 | while read f; do
-            grep -iHn -E "(provisioning|signing|codesign|entitlement|CSSMERR)" "$f" 2>/dev/null | grep -i "error\|fail\|invalid\|no " | tail -15 >> "$ERROR_FILE" || true
-          done
+          if [ "$(wc -l < "$ERROR_FILE")" -le 3 ]; then
+            echo "[xcodebuild stdout/stderr]" >> "$ERROR_FILE"
+            find ~/Library/Logs/gym -name "*.log" 2>/dev/null | head -5 | while read f; do
+              tail -100 "$f" | grep -i "error\|fail\|no library\|xcframework" >> "$ERROR_FILE" || true
+            done
+          fi
+          sort -u -o "$ERROR_FILE" "$ERROR_FILE"
           cat "$ERROR_FILE"
           echo "error_summary_path=$ERROR_FILE" >> $GITHUB_ENV
       
@@ -826,7 +875,7 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: errors-${{ steps.capacitor.outputs.app_name || 'x' }}
+          name: e-${{ github.run_number }}
           path: ${{ env.error_summary_path }}
           retention-days: 1
           if-no-files-found: ignore
@@ -835,23 +884,19 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: logs-${{ steps.capacitor.outputs.app_name || 'x' }}
+          name: l-${{ github.run_number }}
           path: |
             app/ios/App/build*/**/*.log
             app/ios/App/*.log
+            ~/Library/Logs/gym/*.log
           retention-days: 1
           if-no-files-found: ignore
       
       - name: Summary
         if: always()
         run: |
-          echo "| | |" >> $GITHUB_STEP_SUMMARY
-          echo "|---|---|" >> $GITHUB_STEP_SUMMARY
-          echo "| **App** | ${{ steps.capacitor.outputs.app_name }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| **Version** | ${{ inputs.version }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| **Platform** | ${{ inputs.target_platform }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| **Mode** | ${{ inputs.build_mode }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| **WASM** | ${{ steps.features.outputs.has_rust == 'true' && '✅' || '⏭️' }} |" >> $GITHUB_STEP_SUMMARY
-          if [ "${{ job.status }}" != "success" ]; then
+          if [ "${{ job.status }}" == "success" ]; then
+            echo "### ✅" >> $GITHUB_STEP_SUMMARY
+          else
             echo "### ❌" >> $GITHUB_STEP_SUMMARY
           fi
