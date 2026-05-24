@@ -57,6 +57,12 @@ on:
         required: false
         type: string
 
+      mac_category:
+        description: 'Mac category UTI'
+        required: false
+        type: string
+        default: 'public.app-category.utilities'
+
 jobs:
   build:
     runs-on: macos-latest
@@ -573,6 +579,10 @@ jobs:
           /usr/libexec/PlistBuddy -c "Set :LSSupportsOpeningDocumentsInPlace true" App/Info.plist 2>/dev/null || \
             /usr/libexec/PlistBuddy -c "Add :LSSupportsOpeningDocumentsInPlace bool true" App/Info.plist 2>/dev/null || true
           /usr/libexec/PlistBuddy -c "Set :UIFileSharingEnabled true" App/Info.plist 2>/dev/null || true
+          MAC_CAT="${{ inputs.mac_category }}"
+          if [ -z "$MAC_CAT" ]; then MAC_CAT="public.app-category.utilities"; fi
+          /usr/libexec/PlistBuddy -c "Set :LSApplicationCategoryType $MAC_CAT" App/Info.plist 2>/dev/null || \
+            /usr/libexec/PlistBuddy -c "Add :LSApplicationCategoryType string $MAC_CAT" App/Info.plist
       
       - name: Entitlements
         if: inputs.target_platform == 'all_devices' || inputs.target_platform == 'macos_only'
