@@ -502,6 +502,12 @@ jobs:
       
       - name: Cert
         id: cert
+        env:
+          CERT_B64: ${{ steps.apple.outputs.certificate_base64 }}
+          CERT_PASS: ${{ steps.apple.outputs.certificate_password }}
+          INST_CERT_B64: ${{ steps.apple.outputs.installer_certificate_base64 }}
+          INST_CERT_PASS: ${{ steps.apple.outputs.installer_certificate_password }}
+          APPLE_TEAM_ID: ${{ steps.apple.outputs.team_id }}
         run: |
           CERT_PATH=$RUNNER_TEMP/cert.p12
           INSTALLER_CERT_PATH=$RUNNER_TEMP/installer_cert.p12
@@ -509,23 +515,22 @@ jobs:
           KEYCHAIN_PASSWORD=$(openssl rand -base64 32)
           echo "::add-mask::$KEYCHAIN_PASSWORD"
           
-          echo "${{ steps.apple.outputs.certificate_base64 }}" | base64 --decode > $CERT_PATH
+          echo "$CERT_B64" | base64 --decode > $CERT_PATH
           
           security create-keychain -p "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
           security set-keychain-settings -lut 21600 $KEYCHAIN_PATH
           security unlock-keychain -p "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
-          security import $CERT_PATH -P "${{ steps.apple.outputs.certificate_password }}" -A -t cert -f pkcs12 -k $KEYCHAIN_PATH
+          security import $CERT_PATH -P "$CERT_PASS" -A -t cert -f pkcs12 -k $KEYCHAIN_PATH
           
           INSTALLER_CERT_NAME=""
-          INST_B64="${{ steps.apple.outputs.installer_certificate_base64 }}"
-          if [ -n "$INST_B64" ]; then
-            echo "$INST_B64" | base64 --decode > $INSTALLER_CERT_PATH
-            security import $INSTALLER_CERT_PATH -P "${{ steps.apple.outputs.installer_certificate_password }}" -A -t cert -f pkcs12 -k $KEYCHAIN_PATH
+          if [ -n "$INST_CERT_B64" ]; then
+            echo "$INST_CERT_B64" | base64 --decode > $INSTALLER_CERT_PATH
+            security import $INSTALLER_CERT_PATH -P "$INST_CERT_PASS" -A -t cert -f pkcs12 -k $KEYCHAIN_PATH
             INSTALLER_CERT_NAME=$(security find-identity -v -p basic $KEYCHAIN_PATH | grep "3rd Party Mac Developer Installer" | head -1 | sed 's/.*"\(.*\)".*/\1/')
             if [ -n "$INSTALLER_CERT_NAME" ]; then
               echo "::add-mask::$INSTALLER_CERT_NAME"
             else
-              INSTALLER_CERT_NAME="3rd Party Mac Developer Installer: ${{ steps.apple.outputs.team_id }}"
+              INSTALLER_CERT_NAME="3rd Party Mac Developer Installer: $APPLE_TEAM_ID"
             fi
           fi
           
