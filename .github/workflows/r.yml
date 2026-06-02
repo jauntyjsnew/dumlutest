@@ -350,6 +350,81 @@ jobs:
           if [ -z "$PLUGIN_FILE" ] || [ ! -f "$PLUGIN_FILE" ]; then exit 0; fi
           if grep -q "#if !targetEnvironment(macCatalyst)" "$PLUGIN_FILE"; then exit 0; fi
           sed -i.bak 's/CommonFunctionality\.presentCodeRedemptionSheet()/#if !targetEnvironment(macCatalyst)\n            CommonFunctionality.presentCodeRedemptionSheet()\n            #else\n            \/\/ Not available on Mac Catalyst\n            call.reject("Not available on Mac Catalyst")\n            return\n            #endif/g' "$PLUGIN_FILE"
+
+      - name: Geolocation Catalyst Patch
+        if: inputs.target_platform == 'all_devices' || inputs.target_platform == 'macos_only'
+        working-directory: app
+        run: |
+          GEO_DIR="node_modules/@capacitor/geolocation/ios/Sources/GeolocationPlugin"
+          PLUGIN_FILE="$GEO_DIR/GeolocationPlugin.swift"
+          CALLBACK_FILE="$GEO_DIR/GeolocationCallbackManager.swift"
+          MODEL_FILE="$GEO_DIR/IONGLOCPositionModel+JSONTransformer.swift"
+          if [ ! -f "$PLUGIN_FILE" ]; then exit 0; fi
+          if grep -q "GPX_CATALYST_GEO_STUB" "$PLUGIN_FILE"; then exit 0; fi
+
+          ORIG_PLUGIN=$(mktemp)
+          ORIG_CALLBACK=$(mktemp)
+          ORIG_MODEL=$(mktemp)
+          cp "$PLUGIN_FILE" "$ORIG_PLUGIN"
+          [ -f "$CALLBACK_FILE" ] && cp "$CALLBACK_FILE" "$ORIG_CALLBACK"
+          [ -f "$MODEL_FILE" ] && cp "$MODEL_FILE" "$ORIG_MODEL"
+
+          cat > "$PLUGIN_FILE" <<'SWIFT'
+          #if targetEnvironment(macCatalyst)
+          import Capacitor
+
+          @objc(GeolocationPlugin)
+          public class GeolocationPlugin: CAPPlugin, CAPBridgedPlugin {
+              // GPX_CATALYST_GEO_STUB
+              public let identifier = "GeolocationPlugin"
+              public let jsName = "Geolocation"
+              public let pluginMethods: [CAPPluginMethod] = [
+                  .init(name: "getCurrentPosition", returnType: CAPPluginReturnPromise),
+                  .init(name: "watchPosition", returnType: CAPPluginReturnCallback),
+                  .init(name: "clearWatch", returnType: CAPPluginReturnPromise),
+                  .init(name: "checkPermissions", returnType: CAPPluginReturnPromise),
+                  .init(name: "requestPermissions", returnType: CAPPluginReturnPromise)
+              ]
+
+              @objc func getCurrentPosition(_ call: CAPPluginCall) { reject(call) }
+              @objc func watchPosition(_ call: CAPPluginCall) { reject(call) }
+              @objc func clearWatch(_ call: CAPPluginCall) { call.resolve() }
+
+              @objc override public func checkPermissions(_ call: CAPPluginCall) {
+                  call.resolve(["location": "denied", "coarseLocation": "denied"])
+              }
+
+              @objc override public func requestPermissions(_ call: CAPPluginCall) { reject(call) }
+
+              private func reject(_ call: CAPPluginCall) {
+                  call.reject("Geolocation is not available on Mac Catalyst.", "OS-PLUG-GLOC-0007")
+              }
+          }
+          #else
+          SWIFT
+          cat "$ORIG_PLUGIN" >> "$PLUGIN_FILE"
+          cat >> "$PLUGIN_FILE" <<'SWIFT'
+          #endif
+          SWIFT
+
+          wrap_empty_for_catalyst() {
+            TARGET_FILE="$1"
+            ORIG_FILE="$2"
+            [ -f "$TARGET_FILE" ] || return 0
+            cat > "$TARGET_FILE" <<'SWIFT'
+          #if targetEnvironment(macCatalyst)
+          import Capacitor
+          // GPX_CATALYST_GEO_STUB
+          #else
+          SWIFT
+            cat "$ORIG_FILE" >> "$TARGET_FILE"
+            cat >> "$TARGET_FILE" <<'SWIFT'
+          #endif
+          SWIFT
+          }
+
+          wrap_empty_for_catalyst "$CALLBACK_FILE" "$ORIG_CALLBACK"
+          wrap_empty_for_catalyst "$MODEL_FILE" "$ORIG_MODEL"
       
       - name: Ruby
         run: |
@@ -694,6 +769,15 @@ jobs:
             exit 1
           fi
 
+          prepare_geolocation_for_catalyst() {
+            GEO_PODSPEC="../../node_modules/@capacitor/geolocation/CapacitorGeolocation.podspec"
+            if [ -f "$GEO_PODSPEC" ] && grep -q "IONGeolocationLib" "$GEO_PODSPEC"; then
+              sed -i.bak "/IONGeolocationLib/d" "$GEO_PODSPEC"
+              rm -f "$GEO_PODSPEC.bak"
+              if [ -f "Podfile" ]; then pod install; fi
+            fi
+          }
+
           if [ "${{ inputs.build_mode }}" == "build_only" ]; then
             
           if [ "${{ inputs.target_platform }}" == "all_devices" ]; then
@@ -707,6 +791,8 @@ jobs:
               APP_PATH=$(find build-simulator -name "*.app" -type d | head -1)
               cp -R "$APP_PATH" "./${APP_NAME_SAFE}-iOS-Simulator.app"
               zip -r "${APP_NAME_SAFE}-iOS-Simulator.app.zip" "${APP_NAME_SAFE}-iOS-Simulator.app"
+
+              prepare_geolocation_for_catalyst
               
               xcodebuild $XC_ARG \
                 -scheme App -configuration Release \
@@ -728,6 +814,8 @@ jobs:
               zip -r "${APP_NAME_SAFE}-macOS.app.zip" "${APP_NAME_SAFE}-macOS.app"
               
             elif [ "$IS_CATALYST" == "true" ]; then
+              prepare_geolocation_for_catalyst
+
               xcodebuild $XC_ARG \
                 -scheme App -configuration Release \
                 -destination "$DESTINATION" \
@@ -777,6 +865,8 @@ jobs:
             fi
 
             if [ "${{ inputs.target_platform }}" == "macos_only" ] || [ "${{ inputs.target_platform }}" == "all_devices" ]; then
+              prepare_geolocation_for_catalyst
+
               MAC_PROFILE_UUID="${{ steps.mac_provision.outputs.uuid }}"
               if [ -z "$MAC_PROFILE_UUID" ]; then exit 1; fi
               
