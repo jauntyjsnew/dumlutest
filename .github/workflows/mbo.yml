@@ -115,7 +115,16 @@ jobs:
 
       - name: Build number
         id: ver
-        run: echo "build=$(date -u +%Y%m%d%H%M)" >> "$GITHUB_OUTPUT"
+        run: |
+          BUILD=$(date -u +%Y%m%d%H%M)   # unique + monotonically increasing each run
+          echo "build=$BUILD" >> "$GITHUB_OUTPUT"
+          # XcodeGen writes a LITERAL CFBundleVersion (=1) into Info.plist, so xcargs alone
+          # never changed it → App Store rejected re-uploads as "duplicate version". Stamp the
+          # real build number (and marketing version) straight into the plist before archiving.
+          PL=app/App/Info.plist
+          /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $BUILD" "$PL" || /usr/libexec/PlistBuddy -c "Add :CFBundleVersion string $BUILD" "$PL"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString ${{ inputs.version }}" "$PL" || /usr/libexec/PlistBuddy -c "Add :CFBundleShortVersionString string ${{ inputs.version }}" "$PL"
+          echo "Info.plist → CFBundleVersion=$BUILD CFBundleShortVersionString=${{ inputs.version }}"
 
       # ---------- BUILD ONLY (no signing) ----------
       - name: Build (iOS Simulator + macOS, unsigned)
@@ -238,20 +247,29 @@ jobs:
           fi
 
           if [ "${{ inputs.target_platform }}" == "all_devices" ] || [ "${{ inputs.target_platform }}" == "macos_only" ]; then
-            if [ -z "$MAC_PROFILE_UUID" ]; then
-              echo "::warning::No macOS profile passed (mac_provisioning_profile_base64) — skipping macOS archive."
-            else
+            mac_publish() {
+              [ -z "$MAC_PROFILE_UUID" ] && { echo "No macOS profile passed."; return 1; }
               write_export macExport.plist "$MAC_PROFILE_UUID"
               fastlane run build_app project:"MboxRush.xcodeproj" scheme:"$SCHEME" \
                 destination:"generic/platform=macOS" export_method:"app-store" \
                 output_name:"MboxRush-Mac" output_directory:"." \
                 export_options:"macExport.plist" skip_profile_detection:true \
                 installer_cert_name:"$INSTALLER_CERT_NAME" \
-                xcargs:"$XCARGS PROVISIONING_PROFILE_SPECIFIER=$MAC_PROFILE_UUID" clean:true
+                xcargs:"$XCARGS PROVISIONING_PROFILE_SPECIFIER=$MAC_PROFILE_UUID" clean:true || return 1
               PKG=$(ls *.pkg 2>/dev/null | head -1)
-              [ -n "$PKG" ] && fastlane run upload_to_app_store api_key_path:"$API_KEY_PATH" app_identifier:"$BUNDLE_ID" \
+              [ -z "$PKG" ] && { echo "No .pkg produced."; return 1; }
+              fastlane run upload_to_app_store api_key_path:"$API_KEY_PATH" app_identifier:"$BUNDLE_ID" \
                 team_id:"$TEAM_ID" pkg:"$PKG" platform:"osx" \
-                skip_metadata:true skip_screenshots:true submit_for_review:false run_precheck_before_submit:false skip_app_version_update:true
+                skip_metadata:true skip_screenshots:true submit_for_review:false run_precheck_before_submit:false skip_app_version_update:true || return 1
+            }
+            if mac_publish; then
+              echo "macOS uploaded to App Store Connect."
+            elif [ "${{ inputs.target_platform }}" == "macos_only" ]; then
+              echo "::error::macOS publish failed. Pass a *Mac App Store* distribution profile (not Developer ID / Mac Development)."
+              exit 1
+            else
+              # iOS already uploaded above — don't fail the whole job for the bonus Mac build.
+              echo "::warning::macOS publish skipped/failed — needs a *Mac App Store* distribution profile. iOS upload was successful and is unaffected."
             fi
           fi
 
