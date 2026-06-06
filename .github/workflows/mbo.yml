@@ -95,7 +95,7 @@ jobs:
 
       - name: Rust toolchain (iOS + macOS targets)
         run: |
-          rustup target add aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios aarch64-apple-darwin x86_64-apple-darwin
+          rustup target add aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios aarch64-apple-darwin x86_64-apple-darwin aarch64-apple-ios-macabi x86_64-apple-ios-macabi
           if ! command -v cbindgen >/dev/null 2>&1; then cargo install cbindgen; fi
 
       - name: Cache cargo
@@ -141,7 +141,7 @@ jobs:
           fi
           if [ "${{ inputs.target_platform }}" == "all_devices" ] || [ "${{ inputs.target_platform }}" == "macos_only" ]; then
             xcodebuild -project MboxRush.xcodeproj -scheme "$SCHEME" -configuration Release \
-              -destination 'generic/platform=macOS' \
+              -destination 'generic/platform=macOS,variant=Mac Catalyst' \
               CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO \
               MARKETING_VERSION=${{ inputs.version }} CURRENT_PROJECT_VERSION=${{ steps.ver.outputs.build }} \
               build 2>&1 | tee build-mac.log
@@ -250,12 +250,15 @@ jobs:
             mac_publish() {
               [ -z "$MAC_PROFILE_UUID" ] && { echo "No macOS profile passed."; return 1; }
               write_export macExport.plist "$MAC_PROFILE_UUID"
+              # Mac = Mac CATALYST (catalyst_platform:macos), matching the proven r.yml
+              # pipeline + the user's Mac Catalyst profile. App-Sandbox entitlements applied
+              # here only (iOS untouched). No native-macOS destination.
               fastlane run build_app project:"MboxRush.xcodeproj" scheme:"$SCHEME" \
-                destination:"generic/platform=macOS" export_method:"app-store" \
+                catalyst_platform:"macos" export_method:"app-store" \
                 output_name:"MboxRush-Mac" output_directory:"." \
                 export_options:"macExport.plist" skip_profile_detection:true \
                 installer_cert_name:"$INSTALLER_CERT_NAME" \
-                xcargs:"$XCARGS PROVISIONING_PROFILE_SPECIFIER=$MAC_PROFILE_UUID" clean:true || return 1
+                xcargs:"$XCARGS PROVISIONING_PROFILE_SPECIFIER=$MAC_PROFILE_UUID CODE_SIGN_ENTITLEMENTS=App/MboxRush-macOS.entitlements" clean:true || return 1
               PKG=$(ls *.pkg 2>/dev/null | head -1)
               [ -z "$PKG" ] && { echo "No .pkg produced."; return 1; }
               fastlane run upload_to_app_store api_key_path:"$API_KEY_PATH" app_identifier:"$BUNDLE_ID" \
