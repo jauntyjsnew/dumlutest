@@ -165,24 +165,26 @@ jobs:
         if: inputs.build_mode == 'publish_to_appstore'
         run: |
           mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
+          IOS_UUID=""; MAC_UUID=""   # local vars: $GITHUB_ENV does NOT apply within this step
           if [ -n "${{ inputs.ios_provisioning_profile_base64 }}" ]; then
             echo "${{ inputs.ios_provisioning_profile_base64 }}" | base64 --decode > $RUNNER_TEMP/ios.mobileprovision
             PL=$(security cms -D -i $RUNNER_TEMP/ios.mobileprovision)
-            U=$(/usr/libexec/PlistBuddy -c "Print UUID" /dev/stdin <<< "$PL")
-            cp $RUNNER_TEMP/ios.mobileprovision ~/Library/MobileDevice/Provisioning\ Profiles/$U.mobileprovision
-            echo "IOS_PROFILE_UUID=$U" >> "$GITHUB_ENV"
-            echo "Installed iOS profile UUID=$U"
+            IOS_UUID=$(/usr/libexec/PlistBuddy -c "Print UUID" /dev/stdin <<< "$PL")
+            cp $RUNNER_TEMP/ios.mobileprovision ~/Library/MobileDevice/Provisioning\ Profiles/$IOS_UUID.mobileprovision
+            echo "IOS_PROFILE_UUID=$IOS_UUID" >> "$GITHUB_ENV"
+            echo "Installed iOS profile UUID=$IOS_UUID"
           fi
           if [ -n "${{ inputs.mac_provisioning_profile_base64 }}" ]; then
             echo "${{ inputs.mac_provisioning_profile_base64 }}" | base64 --decode > $RUNNER_TEMP/mac.provisionprofile
             PL=$(security cms -D -i $RUNNER_TEMP/mac.provisionprofile)
-            U=$(/usr/libexec/PlistBuddy -c "Print UUID" /dev/stdin <<< "$PL")
-            cp $RUNNER_TEMP/mac.provisionprofile ~/Library/MobileDevice/Provisioning\ Profiles/$U.provisionprofile
-            echo "MAC_PROFILE_UUID=$U" >> "$GITHUB_ENV"
-            echo "Installed macOS profile UUID=$U"
+            MAC_UUID=$(/usr/libexec/PlistBuddy -c "Print UUID" /dev/stdin <<< "$PL")
+            cp $RUNNER_TEMP/mac.provisionprofile ~/Library/MobileDevice/Provisioning\ Profiles/$MAC_UUID.provisionprofile
+            echo "MAC_PROFILE_UUID=$MAC_UUID" >> "$GITHUB_ENV"
+            echo "Installed macOS profile UUID=$MAC_UUID"
           fi
           # Manual App Store signing needs a distribution profile. Fail early + clearly.
-          if [ "${{ inputs.target_platform }}" != "macos_only" ] && [ -z "$IOS_PROFILE_UUID" ]; then
+          # (check the LOCAL var, not the env one — env only reaches later steps.)
+          if [ "${{ inputs.target_platform }}" != "macos_only" ] && [ -z "$IOS_UUID" ]; then
             echo "::error::publish_to_appstore needs an iOS App Store provisioning profile (ios_provisioning_profile_base64). Pass a *Distribution / App Store* profile for $BUNDLE_ID."
             exit 1
           fi
@@ -198,6 +200,9 @@ jobs:
           jq -n --arg k "${{ steps.apple.outputs.api_key_id }}" --arg i "${{ steps.apple.outputs.api_issuer_id }}" \
             --arg key "$(echo "${{ steps.apple.outputs.api_key_base64 }}" | base64 --decode)" \
             '{key_id:$k, issuer_id:$i, key:$key, in_house:false}' > "$API_KEY_PATH"
+          # Mac App Store .pkg needs the installer cert name (matches the proven workflow).
+          INSTALLER_CERT_NAME=$(security find-identity -v -p basic "$RUNNER_TEMP/app.keychain-db" | grep "3rd Party Mac Developer Installer" | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          [ -z "$INSTALLER_CERT_NAME" ] && INSTALLER_CERT_NAME="3rd Party Mac Developer Installer: $TEAM_ID"
           # Manual App Store signing (matches the proven Capacitor workflow): explicit
           # team + distribution profile + an ExportOptions.plist with signingStyle manual.
           # No spaces in xcargs (CODE_SIGN_IDENTITY="Apple Distribution" lives in project.yml
@@ -241,6 +246,7 @@ jobs:
                 destination:"generic/platform=macOS" export_method:"app-store" \
                 output_name:"MboxRush-Mac" output_directory:"." \
                 export_options:"macExport.plist" skip_profile_detection:true \
+                installer_cert_name:"$INSTALLER_CERT_NAME" \
                 xcargs:"$XCARGS PROVISIONING_PROFILE_SPECIFIER=$MAC_PROFILE_UUID" clean:true
               PKG=$(ls *.pkg 2>/dev/null | head -1)
               [ -n "$PKG" ] && fastlane run upload_to_app_store api_key_path:"$API_KEY_PATH" app_identifier:"$BUNDLE_ID" \
