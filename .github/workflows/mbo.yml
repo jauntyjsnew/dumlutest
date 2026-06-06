@@ -167,13 +167,24 @@ jobs:
           mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
           if [ -n "${{ inputs.ios_provisioning_profile_base64 }}" ]; then
             echo "${{ inputs.ios_provisioning_profile_base64 }}" | base64 --decode > $RUNNER_TEMP/ios.mobileprovision
-            U=$(/usr/libexec/PlistBuddy -c "Print UUID" /dev/stdin <<< "$(security cms -D -i $RUNNER_TEMP/ios.mobileprovision)")
+            PL=$(security cms -D -i $RUNNER_TEMP/ios.mobileprovision)
+            U=$(/usr/libexec/PlistBuddy -c "Print UUID" /dev/stdin <<< "$PL")
             cp $RUNNER_TEMP/ios.mobileprovision ~/Library/MobileDevice/Provisioning\ Profiles/$U.mobileprovision
+            echo "IOS_PROFILE_UUID=$U" >> "$GITHUB_ENV"
+            echo "Installed iOS profile UUID=$U"
           fi
           if [ -n "${{ inputs.mac_provisioning_profile_base64 }}" ]; then
             echo "${{ inputs.mac_provisioning_profile_base64 }}" | base64 --decode > $RUNNER_TEMP/mac.provisionprofile
-            U=$(/usr/libexec/PlistBuddy -c "Print UUID" /dev/stdin <<< "$(security cms -D -i $RUNNER_TEMP/mac.provisionprofile)")
+            PL=$(security cms -D -i $RUNNER_TEMP/mac.provisionprofile)
+            U=$(/usr/libexec/PlistBuddy -c "Print UUID" /dev/stdin <<< "$PL")
             cp $RUNNER_TEMP/mac.provisionprofile ~/Library/MobileDevice/Provisioning\ Profiles/$U.provisionprofile
+            echo "MAC_PROFILE_UUID=$U" >> "$GITHUB_ENV"
+            echo "Installed macOS profile UUID=$U"
+          fi
+          # Manual App Store signing needs a distribution profile. Fail early + clearly.
+          if [ "${{ inputs.target_platform }}" != "macos_only" ] && [ -z "$IOS_PROFILE_UUID" ]; then
+            echo "::error::publish_to_appstore needs an iOS App Store provisioning profile (ios_provisioning_profile_base64). Pass a *Distribution / App Store* profile for $BUNDLE_ID."
+            exit 1
           fi
 
       - name: Fastlane archive + upload
@@ -187,27 +198,55 @@ jobs:
           jq -n --arg k "${{ steps.apple.outputs.api_key_id }}" --arg i "${{ steps.apple.outputs.api_issuer_id }}" \
             --arg key "$(echo "${{ steps.apple.outputs.api_key_base64 }}" | base64 --decode)" \
             '{key_id:$k, issuer_id:$i, key:$key, in_house:false}' > "$API_KEY_PATH"
-          XCARGS="DEVELOPMENT_TEAM=$TEAM_ID CURRENT_PROJECT_VERSION=${{ steps.ver.outputs.build }} MARKETING_VERSION=${{ inputs.version }}"
+          # Manual App Store signing (matches the proven Capacitor workflow): explicit
+          # team + distribution profile + an ExportOptions.plist with signingStyle manual.
+          # No spaces in xcargs (CODE_SIGN_IDENTITY="Apple Distribution" lives in project.yml
+          # Release config) so the build settings pass through cleanly.
+          XCARGS="DEVELOPMENT_TEAM=$TEAM_ID CODE_SIGN_STYLE=Manual CODE_SIGNING_REQUIRED=YES CODE_SIGNING_ALLOWED=YES CURRENT_PROJECT_VERSION=${{ steps.ver.outputs.build }} MARKETING_VERSION=${{ inputs.version }}"
+
+          # Write an ExportOptions.plist with echo lines (heredocs are fragile inside YAML).
+          write_export() {  # $1 = output file, $2 = profile UUID
+            {
+              echo '<?xml version="1.0" encoding="UTF-8"?>'
+              echo '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">'
+              echo '<plist version="1.0"><dict>'
+              echo '<key>method</key><string>app-store</string>'
+              echo "<key>teamID</key><string>$TEAM_ID</string>"
+              echo '<key>destination</key><string>export</string>'
+              echo '<key>signingStyle</key><string>manual</string>'
+              echo '<key>provisioningProfiles</key><dict>'
+              echo "<key>$BUNDLE_ID</key><string>$2</string>"
+              echo '</dict></dict></plist>'
+            } > "$1"
+          }
 
           if [ "${{ inputs.target_platform }}" != "macos_only" ]; then
+            write_export iosExport.plist "$IOS_PROFILE_UUID"
             fastlane run build_app project:"MboxRush.xcodeproj" scheme:"$SCHEME" \
               destination:"generic/platform=iOS" export_method:"app-store" \
               output_name:"MboxRush-iOS.ipa" output_directory:"." \
-              export_team_id:"$TEAM_ID" xcargs:"$XCARGS" clean:true
+              export_options:"iosExport.plist" skip_profile_detection:true \
+              xcargs:"$XCARGS PROVISIONING_PROFILE_SPECIFIER=$IOS_PROFILE_UUID" clean:true
             fastlane run upload_to_app_store api_key_path:"$API_KEY_PATH" app_identifier:"$BUNDLE_ID" \
               team_id:"$TEAM_ID" ipa:"MboxRush-iOS.ipa" platform:"ios" \
               skip_metadata:true skip_screenshots:true submit_for_review:false run_precheck_before_submit:false
           fi
 
           if [ "${{ inputs.target_platform }}" == "all_devices" ] || [ "${{ inputs.target_platform }}" == "macos_only" ]; then
-            fastlane run build_app project:"MboxRush.xcodeproj" scheme:"$SCHEME" \
-              destination:"generic/platform=macOS" export_method:"app-store" \
-              output_name:"MboxRush-Mac" output_directory:"." \
-              export_team_id:"$TEAM_ID" xcargs:"$XCARGS" clean:true
-            PKG=$(ls *.pkg 2>/dev/null | head -1)
-            [ -n "$PKG" ] && fastlane run upload_to_app_store api_key_path:"$API_KEY_PATH" app_identifier:"$BUNDLE_ID" \
-              team_id:"$TEAM_ID" pkg:"$PKG" platform:"osx" \
-              skip_metadata:true skip_screenshots:true submit_for_review:false run_precheck_before_submit:false skip_app_version_update:true
+            if [ -z "$MAC_PROFILE_UUID" ]; then
+              echo "::warning::No macOS profile passed (mac_provisioning_profile_base64) — skipping macOS archive."
+            else
+              write_export macExport.plist "$MAC_PROFILE_UUID"
+              fastlane run build_app project:"MboxRush.xcodeproj" scheme:"$SCHEME" \
+                destination:"generic/platform=macOS" export_method:"app-store" \
+                output_name:"MboxRush-Mac" output_directory:"." \
+                export_options:"macExport.plist" skip_profile_detection:true \
+                xcargs:"$XCARGS PROVISIONING_PROFILE_SPECIFIER=$MAC_PROFILE_UUID" clean:true
+              PKG=$(ls *.pkg 2>/dev/null | head -1)
+              [ -n "$PKG" ] && fastlane run upload_to_app_store api_key_path:"$API_KEY_PATH" app_identifier:"$BUNDLE_ID" \
+                team_id:"$TEAM_ID" pkg:"$PKG" platform:"osx" \
+                skip_metadata:true skip_screenshots:true submit_for_review:false run_precheck_before_submit:false skip_app_version_update:true
+            fi
           fi
 
       - name: Upload logs on failure
