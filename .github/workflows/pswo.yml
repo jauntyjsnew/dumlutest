@@ -7,29 +7,19 @@ on:
         description: 'owner/repo'
         required: true
         type: string
-
+      
       repository_branch:
         description: 'Branch'
         required: false
         type: string
         default: 'main'
 
-      scheme:
-        description: 'Xcode scheme (also derives <scheme>.xcodeproj and App/<scheme>-macOS.entitlements)'
-        required: true
-        type: string
-
-      bundle_id:
-        description: 'Bundle identifier'
-        required: true
-        type: string
-
       version:
         description: 'Version (e.g., 1.0.0)'
         required: false
         type: string
         default: '1.0.0'
-
+      
       target_platform:
         description: 'Target'
         required: true
@@ -41,7 +31,7 @@ on:
           - ipad_only
           - macos_only
         default: 'all_devices'
-
+      
       build_mode:
         description: 'Mode'
         required: true
@@ -50,18 +40,18 @@ on:
           - build_only
           - publish_to_appstore
         default: 'build_only'
-
+      
       npm_build_command:
         description: 'Build cmd'
         required: false
         type: string
         default: 'npm run build'
-
-      ios_provisioning_profile_base64:
+      
+      provisioning_profile_base64:
         description: 'iOS profile base64'
         required: false
         type: string
-
+      
       mac_provisioning_profile_base64:
         description: 'Mac profile base64'
         required: false
@@ -77,10 +67,8 @@ jobs:
   build:
     runs-on: macos-latest
     env:
-      SCHEME: ${{ inputs.scheme }}
-      BUNDLE_ID: ${{ inputs.bundle_id }}
-      PROJECT: ${{ inputs.scheme }}.xcodeproj
-      MAC_ENTITLEMENTS: App/${{ inputs.scheme }}-macOS.entitlements
+      SCHEME: PstRush
+      BUNDLE_ID: rush.tools.pst
     steps:
       - uses: maxim-lobanov/setup-xcode@v1
         with:
@@ -161,14 +149,14 @@ jobs:
         run: |
           set -o pipefail
           if [ "${{ inputs.target_platform }}" != "macos_only" ]; then
-            xcodebuild -project "$PROJECT" -scheme "$SCHEME" -configuration Release \
+            xcodebuild -project PstRush.xcodeproj -scheme "$SCHEME" -configuration Release \
               -sdk iphonesimulator -destination 'generic/platform=iOS Simulator' \
               CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO \
               MARKETING_VERSION=${{ inputs.version }} CURRENT_PROJECT_VERSION=${{ steps.ver.outputs.build }} \
               build 2>&1 | tee build-ios.log
           fi
           if [ "${{ inputs.target_platform }}" == "all_devices" ] || [ "${{ inputs.target_platform }}" == "macos_only" ]; then
-            xcodebuild -project "$PROJECT" -scheme "$SCHEME" -configuration Release \
+            xcodebuild -project PstRush.xcodeproj -scheme "$SCHEME" -configuration Release \
               -destination 'generic/platform=macOS,variant=Mac Catalyst' \
               CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO \
               MARKETING_VERSION=${{ inputs.version }} CURRENT_PROJECT_VERSION=${{ steps.ver.outputs.build }} \
@@ -203,8 +191,8 @@ jobs:
         run: |
           mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
           IOS_UUID=""; MAC_UUID=""   # local vars: $GITHUB_ENV does NOT apply within this step
-          if [ -n "${{ inputs.ios_provisioning_profile_base64 }}" ]; then
-            echo "${{ inputs.ios_provisioning_profile_base64 }}" | base64 --decode > $RUNNER_TEMP/ios.mobileprovision
+          if [ -n "${{ inputs.provisioning_profile_base64 }}" ]; then
+            echo "${{ inputs.provisioning_profile_base64 }}" | base64 --decode > $RUNNER_TEMP/ios.mobileprovision
             PL=$(security cms -D -i $RUNNER_TEMP/ios.mobileprovision)
             IOS_UUID=$(/usr/libexec/PlistBuddy -c "Print UUID" /dev/stdin <<< "$PL")
             cp $RUNNER_TEMP/ios.mobileprovision ~/Library/MobileDevice/Provisioning\ Profiles/$IOS_UUID.mobileprovision
@@ -222,7 +210,7 @@ jobs:
           # Manual App Store signing needs a distribution profile. Fail early + clearly.
           # (check the LOCAL var, not the env one — env only reaches later steps.)
           if [ "${{ inputs.target_platform }}" != "macos_only" ] && [ -z "$IOS_UUID" ]; then
-            echo "::error::publish_to_appstore needs an iOS App Store provisioning profile (ios_provisioning_profile_base64). Pass a *Distribution / App Store* profile for $BUNDLE_ID."
+            echo "::error::publish_to_appstore needs an iOS App Store provisioning profile (provisioning_profile_base64). Pass a *Distribution / App Store* profile for $BUNDLE_ID."
             exit 1
           fi
 
@@ -264,13 +252,13 @@ jobs:
 
           if [ "${{ inputs.target_platform }}" != "macos_only" ]; then
             write_export iosExport.plist "$IOS_PROFILE_UUID"
-            fastlane run build_app project:"$PROJECT" scheme:"$SCHEME" \
+            fastlane run build_app project:"PstRush.xcodeproj" scheme:"$SCHEME" \
               destination:"generic/platform=iOS" export_method:"app-store" \
-              output_name:"$SCHEME-iOS.ipa" output_directory:"." \
+              output_name:"PstRush-iOS.ipa" output_directory:"." \
               export_options:"iosExport.plist" skip_profile_detection:true \
               xcargs:"$XCARGS PROVISIONING_PROFILE_SPECIFIER=$IOS_PROFILE_UUID" clean:true
             fastlane run upload_to_app_store api_key_path:"$API_KEY_PATH" app_identifier:"$BUNDLE_ID" \
-              team_id:"$TEAM_ID" ipa:"$SCHEME-iOS.ipa" platform:"ios" \
+              team_id:"$TEAM_ID" ipa:"PstRush-iOS.ipa" platform:"ios" \
               skip_metadata:true skip_screenshots:true submit_for_review:false run_precheck_before_submit:false
           fi
 
@@ -281,12 +269,12 @@ jobs:
               # Mac = Mac CATALYST (catalyst_platform:macos), matching the proven r.yml
               # pipeline + the user's Mac Catalyst profile. App-Sandbox entitlements applied
               # here only (iOS untouched). No native-macOS destination.
-              fastlane run build_app project:"$PROJECT" scheme:"$SCHEME" \
+              fastlane run build_app project:"PstRush.xcodeproj" scheme:"$SCHEME" \
                 catalyst_platform:"macos" export_method:"app-store" \
-                output_name:"$SCHEME-Mac" output_directory:"." \
+                output_name:"PstRush-Mac" output_directory:"." \
                 export_options:"macExport.plist" skip_profile_detection:true \
                 installer_cert_name:"$INSTALLER_CERT_NAME" \
-                xcargs:"$XCARGS PROVISIONING_PROFILE_SPECIFIER=$MAC_PROFILE_UUID CODE_SIGN_ENTITLEMENTS=$MAC_ENTITLEMENTS" clean:true || return 1
+                xcargs:"$XCARGS PROVISIONING_PROFILE_SPECIFIER=$MAC_PROFILE_UUID CODE_SIGN_ENTITLEMENTS=App/PstRush-macOS.entitlements" clean:true || return 1
               PKG=$(ls *.pkg 2>/dev/null | head -1)
               [ -z "$PKG" ] && { echo "No .pkg produced."; return 1; }
               fastlane run upload_to_app_store api_key_path:"$API_KEY_PATH" app_identifier:"$BUNDLE_ID" \
