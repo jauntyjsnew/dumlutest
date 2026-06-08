@@ -1,4 +1,6 @@
-name: mbo-pst
+name: mbo
+
+
 
 on:
   workflow_dispatch:
@@ -7,19 +9,16 @@ on:
         description: 'owner/repo'
         required: true
         type: string
-      
       repository_branch:
         description: 'Branch'
         required: false
         type: string
         default: 'main'
-
       version:
-        description: 'Version (e.g., 1.0.0)'
+        description: 'Version (e.g. 1.0.0)'
         required: false
         type: string
         default: '1.0.0'
-      
       target_platform:
         description: 'Target'
         required: true
@@ -27,11 +26,8 @@ on:
         options:
           - all_devices
           - iphone_and_ipad
-          - iphone_only
-          - ipad_only
           - macos_only
         default: 'all_devices'
-      
       build_mode:
         description: 'Mode'
         required: true
@@ -40,28 +36,14 @@ on:
           - build_only
           - publish_to_appstore
         default: 'build_only'
-      
-      npm_build_command:
-        description: 'Build cmd'
+      ios_provisioning_profile_base64:
+        description: 'iOS App Store profile (base64)'
         required: false
         type: string
-        default: 'npm run build'
-      
-      provisioning_profile_base64:
-        description: 'iOS profile base64'
-        required: false
-        type: string
-      
       mac_provisioning_profile_base64:
-        description: 'Mac profile base64'
+        description: 'Mac App Store profile (base64)'
         required: false
         type: string
-
-      mac_category:
-        description: 'Mac category UTI'
-        required: false
-        type: string
-        default: 'public.app-category.utilities'
 
 jobs:
   build:
