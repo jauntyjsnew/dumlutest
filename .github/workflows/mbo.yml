@@ -1,4 +1,4 @@
-name: R
+name: mbo-pst
 
 on:
   workflow_dispatch:
