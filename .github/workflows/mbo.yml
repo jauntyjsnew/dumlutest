@@ -1,4 +1,4 @@
-name: mbo-pst
+name: R
 
 on:
   workflow_dispatch:
@@ -56,6 +56,12 @@ on:
         description: 'Mac profile base64'
         required: false
         type: string
+
+      mac_category:
+        description: 'Mac category UTI'
+        required: false
+        type: string
+        default: 'public.app-category.utilities'
 
 jobs:
   build:
