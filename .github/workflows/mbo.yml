@@ -36,7 +36,7 @@ on:
           - build_only
           - publish_to_appstore
         default: 'build_only'
-      ios_provisioning_profile_base64:
+      provisioning_profile_base64:
         description: 'iOS App Store profile (base64)'
         required: false
         type: string
@@ -173,8 +173,8 @@ jobs:
         run: |
           mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
           IOS_UUID=""; MAC_UUID=""   # local vars: $GITHUB_ENV does NOT apply within this step
-          if [ -n "${{ inputs.ios_provisioning_profile_base64 }}" ]; then
-            echo "${{ inputs.ios_provisioning_profile_base64 }}" | base64 --decode > $RUNNER_TEMP/ios.mobileprovision
+          if [ -n "${{ inputs.provisioning_profile_base64 }}" ]; then
+            echo "${{ inputs.provisioning_profile_base64 }}" | base64 --decode > $RUNNER_TEMP/ios.mobileprovision
             PL=$(security cms -D -i $RUNNER_TEMP/ios.mobileprovision)
             IOS_UUID=$(/usr/libexec/PlistBuddy -c "Print UUID" /dev/stdin <<< "$PL")
             cp $RUNNER_TEMP/ios.mobileprovision ~/Library/MobileDevice/Provisioning\ Profiles/$IOS_UUID.mobileprovision
@@ -192,7 +192,7 @@ jobs:
           # Manual App Store signing needs a distribution profile. Fail early + clearly.
           # (check the LOCAL var, not the env one — env only reaches later steps.)
           if [ "${{ inputs.target_platform }}" != "macos_only" ] && [ -z "$IOS_UUID" ]; then
-            echo "::error::publish_to_appstore needs an iOS App Store provisioning profile (ios_provisioning_profile_base64). Pass a *Distribution / App Store* profile for $BUNDLE_ID."
+            echo "::error::publish_to_appstore needs an iOS App Store provisioning profile (provisioning_profile_base64). Pass a *Distribution / App Store* profile for $BUNDLE_ID."
             exit 1
           fi
 
