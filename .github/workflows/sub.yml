@@ -1,0 +1,341 @@
+name: sub publish
+
+on:
+  workflow_dispatch:
+    inputs:
+      repository_url:
+        description: 'owner/repo'
+        required: true
+        type: string
+      
+      repository_branch:
+        description: 'Branch'
+        required: false
+        type: string
+        default: 'main'
+
+      version:
+        description: 'Version (e.g., 1.0.0)'
+        required: false
+        type: string
+        default: '1.0.0'
+      
+      target_platform:
+        description: 'Target'
+        required: true
+        type: choice
+        options:
+          - all_devices
+          - iphone_and_ipad
+          - iphone_only
+          - ipad_only
+          - macos_only
+        default: 'all_devices'
+      
+      build_mode:
+        description: 'Mode'
+        required: true
+        type: choice
+        options:
+          - build_only
+          - publish_to_appstore
+        default: 'build_only'
+      
+      npm_build_command:
+        description: 'Build cmd'
+        required: false
+        type: string
+        default: 'npm run build'
+      
+      provisioning_profile_base64:
+        description: 'iOS profile base64'
+        required: false
+        type: string
+      
+      mac_provisioning_profile_base64:
+        description: 'Mac profile base64'
+        required: false
+        type: string
+
+      mac_category:
+        description: 'Mac category UTI'
+        required: false
+        type: string
+        default: 'public.app-category.utilities'
+
+jobs:
+  build:
+    runs-on: macos-latest
+    env:
+      SCHEME: SubTracker
+      BUNDLE_ID: rush.tools.subtracker
+      WIDGET_BUNDLE_ID: rush.tools.subtracker.widgets
+    steps:
+      - uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+
+      - name: Parse Apple credentials
+        id: apple
+        env:
+          APPLE_CREDS: ${{ secrets.APPLE_CREDENTIALS }}
+        run: |
+          TEAM_ID=$(echo "$APPLE_CREDS" | jq -r '.team_id')
+          CERT_B64=$(echo "$APPLE_CREDS" | jq -r '.certificate_base64')
+          CERT_PASS=$(echo "$APPLE_CREDS" | jq -r '.certificate_password')
+          INST_B64=$(echo "$APPLE_CREDS" | jq -r '.installer_certificate_base64 // empty')
+          INST_PASS=$(echo "$APPLE_CREDS" | jq -r '.installer_certificate_password // .certificate_password')
+          API_KEY_ID=$(echo "$APPLE_CREDS" | jq -r '.api_key_id')
+          API_ISSUER=$(echo "$APPLE_CREDS" | jq -r '.api_issuer_id')
+          API_B64=$(echo "$APPLE_CREDS" | jq -r '.api_key_base64')
+          for v in "$TEAM_ID" "$CERT_B64" "$CERT_PASS" "$API_KEY_ID" "$API_ISSUER" "$API_B64" "$INST_B64" "$INST_PASS"; do
+            [ -n "$v" ] && echo "::add-mask::$v"
+          done
+          {
+            echo "team_id=$TEAM_ID"
+            echo "certificate_base64=$CERT_B64"
+            echo "certificate_password=$CERT_PASS"
+            echo "installer_certificate_base64=$INST_B64"
+            echo "installer_certificate_password=$INST_PASS"
+            echo "api_key_id=$API_KEY_ID"
+            echo "api_issuer_id=$API_ISSUER"
+            echo "api_key_base64=$API_B64"
+          } >> "$GITHUB_OUTPUT"
+
+      # The widget extension (WIDGET_BUNDLE_ID) needs its own App Store provisioning
+      # profile. Inputs must stay byte-identical to the template (the Chrome extension
+      # auto-fills by key name), so the widget profile rides in as a repo SECRET instead.
+      - name: Require widget provisioning profile secret
+        if: inputs.build_mode == 'publish_to_appstore' && inputs.target_platform != 'macos_only'
+        env:
+          WIDGET_PROFILE_B64: ${{ secrets.SUBTRACKER_WIDGET_PROFILE_B64 }}
+        run: |
+          if [ -z "$WIDGET_PROFILE_B64" ]; then
+            echo "::error::Missing secret SUBTRACKER_WIDGET_PROFILE_B64 (widget provisioning profile)"
+            echo "Missing secret SUBTRACKER_WIDGET_PROFILE_B64 (widget provisioning profile)"
+            exit 1
+          fi
+          echo "Widget provisioning profile secret present."
+
+      - name: Clone app repo
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.repository_url }}
+          ref: ${{ inputs.repository_branch }}
+          token: ${{ secrets.GH_PAT }}
+          path: app
+
+      # SubTracker is pure SwiftUI — no Rust engine, no npm build. This app ships
+      # iOS-only (Apple Silicon Macs get it as Designed-for-iPad automatically).
+      - name: Reject macos_only (iOS-only app)
+        if: inputs.target_platform == 'macos_only'
+        run: |
+          echo "::error::SubTracker ships iOS-only (Designed for iPad on Mac). Use iphone_and_ipad."
+          exit 1
+
+      - name: XcodeGen
+        run: |
+          brew install xcodegen
+          cd app && xcodegen generate
+
+      - name: Build number
+        id: ver
+        run: |
+          BUILD=$(date -u +%Y%m%d%H%M)   # unique + monotonically increasing each run
+          echo "build=$BUILD" >> "$GITHUB_OUTPUT"
+          # XcodeGen writes a LITERAL CFBundleVersion (=1) into Info.plist, so xcargs alone
+          # never changed it → App Store rejected re-uploads as "duplicate version". Stamp the
+          # real build number (and marketing version) straight into the plist before archiving.
+          PL=app/App/Info.plist
+          /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $BUILD" "$PL" || /usr/libexec/PlistBuddy -c "Add :CFBundleVersion string $BUILD" "$PL"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString ${{ inputs.version }}" "$PL" || /usr/libexec/PlistBuddy -c "Add :CFBundleShortVersionString string ${{ inputs.version }}" "$PL"
+          echo "Info.plist → CFBundleVersion=$BUILD CFBundleShortVersionString=${{ inputs.version }}"
+
+      # ---------- BUILD ONLY (no signing) ----------
+      # iOS-only app: no Catalyst leg (project has no Mac Catalyst support, by design).
+      - name: Build (iOS Simulator, unsigned)
+        if: inputs.build_mode == 'build_only'
+        working-directory: app
+        run: |
+          set -o pipefail
+          xcodebuild -project SubTracker.xcodeproj -scheme "$SCHEME" -configuration Release \
+            -sdk iphonesimulator -destination 'generic/platform=iOS Simulator' \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO \
+            MARKETING_VERSION=${{ inputs.version }} CURRENT_PROJECT_VERSION=${{ steps.ver.outputs.build }} \
+            build 2>&1 | tee build-ios.log
+          echo "Build-only completed."
+
+      # ---------- PUBLISH (signed archive + upload) ----------
+      - name: Import signing certificate
+        if: inputs.build_mode == 'publish_to_appstore'
+        env:
+          CERT_B64: ${{ steps.apple.outputs.certificate_base64 }}
+          CERT_PASS: ${{ steps.apple.outputs.certificate_password }}
+          INST_B64: ${{ steps.apple.outputs.installer_certificate_base64 }}
+          INST_PASS: ${{ steps.apple.outputs.installer_certificate_password }}
+        run: |
+          KC=$RUNNER_TEMP/app.keychain-db
+          KP=$(openssl rand -base64 24); echo "::add-mask::$KP"
+          security create-keychain -p "$KP" "$KC"
+          security set-keychain-settings -lut 21600 "$KC"
+          security unlock-keychain -p "$KP" "$KC"
+          echo "$CERT_B64" | base64 --decode > $RUNNER_TEMP/cert.p12
+          security import $RUNNER_TEMP/cert.p12 -P "$CERT_PASS" -A -t cert -f pkcs12 -k "$KC"
+          if [ -n "$INST_B64" ]; then
+            echo "$INST_B64" | base64 --decode > $RUNNER_TEMP/inst.p12
+            security import $RUNNER_TEMP/inst.p12 -P "$INST_PASS" -A -t cert -f pkcs12 -k "$KC"
+          fi
+          security list-keychain -d user -s "$KC"
+
+      - name: Install provisioning profiles
+        if: inputs.build_mode == 'publish_to_appstore'
+        env:
+          WIDGET_PROFILE_B64: ${{ secrets.SUBTRACKER_WIDGET_PROFILE_B64 }}
+        run: |
+          mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
+          IOS_UUID=""; MAC_UUID=""; WIDGET_UUID=""   # local vars: $GITHUB_ENV does NOT apply within this step
+          if [ -n "${{ inputs.provisioning_profile_base64 }}" ]; then
+            echo "${{ inputs.provisioning_profile_base64 }}" | base64 --decode > $RUNNER_TEMP/ios.mobileprovision
+            PL=$(security cms -D -i $RUNNER_TEMP/ios.mobileprovision)
+            IOS_UUID=$(/usr/libexec/PlistBuddy -c "Print UUID" /dev/stdin <<< "$PL")
+            cp $RUNNER_TEMP/ios.mobileprovision ~/Library/MobileDevice/Provisioning\ Profiles/$IOS_UUID.mobileprovision
+            echo "IOS_PROFILE_UUID=$IOS_UUID" >> "$GITHUB_ENV"
+            echo "Installed iOS profile UUID=$IOS_UUID"
+          fi
+          if [ -n "${{ inputs.mac_provisioning_profile_base64 }}" ]; then
+            echo "${{ inputs.mac_provisioning_profile_base64 }}" | base64 --decode > $RUNNER_TEMP/mac.provisionprofile
+            PL=$(security cms -D -i $RUNNER_TEMP/mac.provisionprofile)
+            MAC_UUID=$(/usr/libexec/PlistBuddy -c "Print UUID" /dev/stdin <<< "$PL")
+            cp $RUNNER_TEMP/mac.provisionprofile ~/Library/MobileDevice/Provisioning\ Profiles/$MAC_UUID.provisionprofile
+            echo "MAC_PROFILE_UUID=$MAC_UUID" >> "$GITHUB_ENV"
+            echo "Installed macOS profile UUID=$MAC_UUID"
+          fi
+          # Widget extension profile (from repo secret, NOT an input — inputs stay template-identical).
+          if [ -n "$WIDGET_PROFILE_B64" ]; then
+            echo "$WIDGET_PROFILE_B64" | base64 --decode > $RUNNER_TEMP/widget.mobileprovision
+            PL=$(security cms -D -i $RUNNER_TEMP/widget.mobileprovision)
+            WIDGET_UUID=$(/usr/libexec/PlistBuddy -c "Print UUID" /dev/stdin <<< "$PL")
+            cp $RUNNER_TEMP/widget.mobileprovision ~/Library/MobileDevice/Provisioning\ Profiles/$WIDGET_UUID.mobileprovision
+            echo "WIDGET_PROFILE_UUID=$WIDGET_UUID" >> "$GITHUB_ENV"
+            echo "Installed widget profile UUID=$WIDGET_UUID"
+          fi
+          # Manual App Store signing needs a distribution profile. Fail early + clearly.
+          # (check the LOCAL var, not the env one — env only reaches later steps.)
+          if [ "${{ inputs.target_platform }}" != "macos_only" ] && [ -z "$IOS_UUID" ]; then
+            echo "::error::publish_to_appstore needs an iOS App Store provisioning profile (provisioning_profile_base64). Pass a *Distribution / App Store* profile for $BUNDLE_ID."
+            exit 1
+          fi
+          if [ "${{ inputs.target_platform }}" != "macos_only" ] && [ -z "$WIDGET_UUID" ]; then
+            echo "::error::Missing secret SUBTRACKER_WIDGET_PROFILE_B64 (widget provisioning profile)"
+            exit 1
+          fi
+
+      - name: Fastlane archive + upload
+        if: inputs.build_mode == 'publish_to_appstore'
+        working-directory: app
+        env:
+          TEAM_ID: ${{ steps.apple.outputs.team_id }}
+        run: |
+          gem install fastlane --no-document
+          API_KEY_PATH="$RUNNER_TEMP/api_key.json"
+          jq -n --arg k "${{ steps.apple.outputs.api_key_id }}" --arg i "${{ steps.apple.outputs.api_issuer_id }}" \
+            --arg key "$(echo "${{ steps.apple.outputs.api_key_base64 }}" | base64 --decode)" \
+            '{key_id:$k, issuer_id:$i, key:$key, in_house:false}' > "$API_KEY_PATH"
+          # Mac App Store .pkg needs the installer cert name (matches the proven workflow).
+          INSTALLER_CERT_NAME=$(security find-identity -v -p basic "$RUNNER_TEMP/app.keychain-db" | grep "3rd Party Mac Developer Installer" | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          [ -z "$INSTALLER_CERT_NAME" ] && INSTALLER_CERT_NAME="3rd Party Mac Developer Installer: $TEAM_ID"
+          # Manual App Store signing (matches the proven Capacitor workflow): explicit
+          # team + distribution profile + an ExportOptions.plist with signingStyle manual.
+          # No spaces in xcargs (CODE_SIGN_IDENTITY="Apple Distribution" lives in project.yml
+          # Release config) so the build settings pass through cleanly.
+          XCARGS="DEVELOPMENT_TEAM=$TEAM_ID CODE_SIGN_STYLE=Manual CODE_SIGNING_REQUIRED=YES CODE_SIGNING_ALLOWED=YES CURRENT_PROJECT_VERSION=${{ steps.ver.outputs.build }} MARKETING_VERSION=${{ inputs.version }}"
+
+          # Write an ExportOptions.plist with echo lines (heredocs are fragile inside YAML).
+          # provisioningProfiles must map BOTH the app and the embedded widget extension,
+          # otherwise the export re-sign step rejects the widget.
+          write_export() {  # $1 = output file, $2 = app profile UUID, $3 = widget profile UUID (optional)
+            {
+              echo '<?xml version="1.0" encoding="UTF-8"?>'
+              echo '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">'
+              echo '<plist version="1.0"><dict>'
+              echo '<key>method</key><string>app-store</string>'
+              echo "<key>teamID</key><string>$TEAM_ID</string>"
+              echo '<key>destination</key><string>export</string>'
+              echo '<key>signingStyle</key><string>manual</string>'
+              echo '<key>provisioningProfiles</key><dict>'
+              echo "<key>$BUNDLE_ID</key><string>$2</string>"
+              if [ -n "${3:-}" ]; then
+                echo "<key>$WIDGET_BUNDLE_ID</key><string>$3</string>"
+              fi
+              echo '</dict></dict></plist>'
+            } > "$1"
+          }
+
+          if [ "${{ inputs.target_platform }}" != "macos_only" ]; then
+            write_export iosExport.plist "$IOS_PROFILE_UUID" "$WIDGET_PROFILE_UUID"
+            # A GLOBAL PROVISIONING_PROFILE_SPECIFIER xcarg would force the APP profile onto
+            # the widget target too (bundle-id mismatch -> archive fails). Stamp each target's
+            # own profile into the project instead, then archive WITHOUT the global override.
+            for T in $(xcodebuild -list -project SubTracker.xcodeproj -json | jq -r '.project.targets[]'); do
+              BID=$(xcodebuild -showBuildSettings -project SubTracker.xcodeproj -target "$T" 2>/dev/null | sed -n 's/^ *PRODUCT_BUNDLE_IDENTIFIER = //p' | head -1)
+              case "$BID" in
+                "$BUNDLE_ID")
+                  fastlane run update_code_signing_settings path:"SubTracker.xcodeproj" use_automatic_signing:false \
+                    team_id:"$TEAM_ID" code_sign_identity:"Apple Distribution" \
+                    profile_name:"$IOS_PROFILE_UUID" targets:"$T" ;;
+                "$WIDGET_BUNDLE_ID")
+                  fastlane run update_code_signing_settings path:"SubTracker.xcodeproj" use_automatic_signing:false \
+                    team_id:"$TEAM_ID" code_sign_identity:"Apple Distribution" \
+                    profile_name:"$WIDGET_PROFILE_UUID" targets:"$T" ;;
+              esac
+            done
+            fastlane run build_app project:"SubTracker.xcodeproj" scheme:"$SCHEME" \
+              destination:"generic/platform=iOS" export_method:"app-store" \
+              output_name:"SubTracker-iOS.ipa" output_directory:"." \
+              export_options:"iosExport.plist" skip_profile_detection:true \
+              xcargs:"$XCARGS" clean:true
+            fastlane run upload_to_app_store api_key_path:"$API_KEY_PATH" app_identifier:"$BUNDLE_ID" \
+              team_id:"$TEAM_ID" ipa:"SubTracker-iOS.ipa" platform:"ios" \
+              skip_metadata:true skip_screenshots:true submit_for_review:false run_precheck_before_submit:false
+          fi
+
+          if [ "${{ inputs.target_platform }}" == "all_devices" ] || [ "${{ inputs.target_platform }}" == "macos_only" ]; then
+            mac_publish() {
+              [ -z "$MAC_PROFILE_UUID" ] && { echo "No macOS profile passed."; return 1; }
+              write_export macExport.plist "$MAC_PROFILE_UUID"
+              # Mac = Mac CATALYST (catalyst_platform:macos), matching the proven r.yml
+              # pipeline + the user's Mac Catalyst profile. App-Sandbox entitlements applied
+              # here only (iOS untouched). No native-macOS destination.
+              fastlane run build_app project:"SubTracker.xcodeproj" scheme:"$SCHEME" \
+                catalyst_platform:"macos" export_method:"app-store" \
+                output_name:"SubTracker-Mac" output_directory:"." \
+                export_options:"macExport.plist" skip_profile_detection:true \
+                installer_cert_name:"$INSTALLER_CERT_NAME" \
+                xcargs:"$XCARGS PROVISIONING_PROFILE_SPECIFIER=$MAC_PROFILE_UUID CODE_SIGN_ENTITLEMENTS=App/SubTracker-macOS.entitlements" clean:true || return 1
+              PKG=$(ls *.pkg 2>/dev/null | head -1)
+              [ -z "$PKG" ] && { echo "No .pkg produced."; return 1; }
+              fastlane run upload_to_app_store api_key_path:"$API_KEY_PATH" app_identifier:"$BUNDLE_ID" \
+                team_id:"$TEAM_ID" pkg:"$PKG" platform:"osx" \
+                skip_metadata:true skip_screenshots:true submit_for_review:false run_precheck_before_submit:false skip_app_version_update:true || return 1
+            }
+            if mac_publish; then
+              echo "macOS uploaded to App Store Connect."
+            elif [ "${{ inputs.target_platform }}" == "macos_only" ]; then
+              echo "::error::macOS publish failed. Pass a *Mac App Store* distribution profile (not Developer ID / Mac Development)."
+              exit 1
+            else
+              # iOS already uploaded above — don't fail the whole job for the bonus Mac build.
+              echo "::warning::macOS publish skipped/failed — needs a *Mac App Store* distribution profile. iOS upload was successful and is unaffected."
+            fi
+          fi
+
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-${{ github.run_number }}
+          path: |
+            app/*.log
+            ~/Library/Logs/gym/*.log
+          if-no-files-found: ignore
+          retention-days: 2
