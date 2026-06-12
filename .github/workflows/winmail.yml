@@ -786,6 +786,21 @@ jobs:
           ruby disable_signing.rb
           rm disable_signing.rb
 
+      - name: Mac Exclude ShareExt
+        if: inputs.target_platform == 'macos_only'
+        working-directory: app/ios/App
+        run: |
+          echo "require 'xcodeproj'" > strip_shareext.rb
+          echo "project = Xcodeproj::Project.open('App.xcodeproj')" >> strip_shareext.rb
+          echo "app = project.targets.find { |t| t.name == 'App' }" >> strip_shareext.rb
+          echo "app.copy_files_build_phases.each { |ph| ph.files.dup.each { |bf| bf.remove_from_project if bf.display_name.to_s =~ /ShareExt/ } }" >> strip_shareext.rb
+          echo "app.dependencies.dup.each { |d| d.remove_from_project if (d.target && d.target.name == 'ShareExt') || d.display_name.to_s =~ /ShareExt/ }" >> strip_shareext.rb
+          echo "project.targets.select { |t| t.name == 'ShareExt' }.each { |t| t.remove_from_project }" >> strip_shareext.rb
+          echo "project.save" >> strip_shareext.rb
+          ruby strip_shareext.rb
+          rm strip_shareext.rb
+          /usr/libexec/PlistBuddy -c "Delete :com.apple.security.application-groups" App/App.entitlements 2>/dev/null || true
+
       - name: Build App
         working-directory: app/ios/App
         run: |
