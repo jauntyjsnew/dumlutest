@@ -1,4 +1,4 @@
-name: Win-ios-mac-ayrı-yap-alldevices yapma
+name: Win-ios-mac-ayrı-YES-alldevices-NOOO
 
 on:
   workflow_dispatch:
