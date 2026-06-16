@@ -1,4 +1,4 @@
-name: Win-ilk ios-sonra mac-alldevices yapma
+name: Win-ios-mac-ayrı-yap-alldevices yapma
 
 on:
   workflow_dispatch:
