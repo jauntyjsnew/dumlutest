@@ -1,4 +1,4 @@
-name: Winmail
+name: Win-ilk ios-sonra mac-alldevices yapma
 
 on:
   workflow_dispatch:
