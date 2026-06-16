@@ -52,11 +52,6 @@ on:
         required: false
         type: string
       
-      shareext_provisioning_profile_base64:
-        description: 'ShareExt iOS profile base64 (winmail)'
-        required: false
-        type: string
-      
       mac_provisioning_profile_base64:
         description: 'Mac profile base64'
         required: false
@@ -77,9 +72,6 @@ jobs:
         run: |
           if [ -n "${{ inputs.provisioning_profile_base64 }}" ]; then
             echo "::add-mask::${{ inputs.provisioning_profile_base64 }}"
-          fi
-          if [ -n "${{ inputs.shareext_provisioning_profile_base64 }}" ]; then
-            echo "::add-mask::${{ inputs.shareext_provisioning_profile_base64 }}"
           fi
           if [ -n "${{ inputs.mac_provisioning_profile_base64 }}" ]; then
             echo "::add-mask::${{ inputs.mac_provisioning_profile_base64 }}"
@@ -646,10 +638,14 @@ jobs:
 
       - name: ShareExt Profile
         id: shareext_provision
-        if: inputs.shareext_provisioning_profile_base64 != ''
+        if: inputs.build_mode == 'publish_to_appstore'
+        env:
+          SE_B64: ${{ secrets.WINMAIL_SHAREEXT_PROFILE }}
         run: |
+          if [ -z "$SE_B64" ]; then echo "No ShareExt profile secret set - skipping."; exit 0; fi
+          echo "::add-mask::$SE_B64"
           SE_PP_PATH=$RUNNER_TEMP/shareext_profile.mobileprovision
-          echo "${{ inputs.shareext_provisioning_profile_base64 }}" | base64 --decode > $SE_PP_PATH
+          echo "$SE_B64" | base64 --decode > $SE_PP_PATH
           SE_UUID=$(/usr/libexec/PlistBuddy -c "Print UUID" /dev/stdin <<< $(security cms -D -i $SE_PP_PATH))
           echo "::add-mask::$SE_UUID"
           mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
