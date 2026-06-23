@@ -297,7 +297,8 @@ jobs:
               xcargs:"$XCARGS" clean:true
             fastlane run upload_to_app_store api_key_path:"$API_KEY_PATH" app_identifier:"$BUNDLE_ID" \
               team_id:"$TEAM_ID" ipa:"SubTracker-iOS.ipa" platform:"ios" \
-              skip_metadata:true skip_screenshots:true submit_for_review:false run_precheck_before_submit:false
+              skip_metadata:true skip_screenshots:true submit_for_review:false run_precheck_before_submit:false \
+              skip_app_version_update:true
           fi
 
           # iOS-only app: Mac Catalyst publish bacagi YOK (Designed-for-iPad otomatik).

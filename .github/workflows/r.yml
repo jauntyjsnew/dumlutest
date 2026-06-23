@@ -939,7 +939,8 @@ jobs:
               api_key_path:"$API_KEY_PATH" app_identifier:"$BUNDLE_ID" team_id:"$TEAM_ID" \
               ipa:"${APP_NAME_SAFE}-iOS.ipa" platform:"ios" \
               skip_metadata:true skip_screenshots:true \
-              run_precheck_before_submit:false submit_for_review:false
+              run_precheck_before_submit:false submit_for_review:false \
+              skip_app_version_update:true
           fi
 
           MAC_FILE=""
@@ -952,7 +953,8 @@ jobs:
                 api_key_path:"$API_KEY_PATH" app_identifier:"$BUNDLE_ID" team_id:"$TEAM_ID" \
                 ipa:"$MAC_FILE" platform:"osx" \
                 skip_metadata:true skip_screenshots:true \
-                run_precheck_before_submit:false submit_for_review:false
+                run_precheck_before_submit:false submit_for_review:false \
+                skip_app_version_update:true
             else
                fastlane run upload_to_app_store \
                 api_key_path:"$API_KEY_PATH" app_identifier:"$BUNDLE_ID" team_id:"$TEAM_ID" \
