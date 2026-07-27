@@ -492,6 +492,39 @@ jobs:
         if: inputs.target_platform == 'all_devices' || inputs.target_platform == 'macos_only'
         working-directory: app/ios/App
         run: |
+          # ── Keep @capacitor/filesystem linkable for Mac ──────────────────
+          # MEASURED 2026-07-27. @capacitor/filesystem v7+ depends on
+          # IONFilesystemLib, which ships as a PREBUILT .xcframework whose
+          # Info.plist carries exactly two slices: ios-arm64 and
+          # ios-arm64_x86_64-simulator. There is no maccatalyst slice, so it can
+          # never link into a Catalyst build — which is why this step used to
+          # delete the pod outright. But deleting it does not remove the plugin
+          # from packageClassList, so the app kept asking Capacitor for a class
+          # that was not in the binary and every save died at runtime with
+          # `"Filesystem" plugin is not implemented on ios` — on Mac AND in the
+          # iOS ipa, because this job strips the SPM package and builds both
+          # archives from these Pods. MHT Viewer shipped that way.
+          #
+          # v6 has no IONFilesystemLib: pure Swift, `import Capacitor` only. So
+          # pin v6 here instead of amputating the feature. Verified end to end:
+          # Mac Catalyst BUILD SUCCEEDED with CapacitorFilesystem.framework in
+          # the bundle, and on a simulator `Filesystem.writeFile` returned a real
+          # uri and the file was on disk. The JS API used across the portfolio
+          # (writeFile/readFile/deleteFile/mkdir/readdir/stat + Directory,
+          # Encoding) is identical in v6, and anything missing fails the TS build
+          # loudly rather than at runtime.
+          #
+          # Safe here specifically: `cap sync` and `SPM Clean` have already run,
+          # so nothing downstream resolves this package through SPM.
+          if [ -f "../../node_modules/@capacitor/filesystem/package.json" ]; then
+            FS_VER=$(node -p "require('../../node_modules/@capacitor/filesystem/package.json').version" 2>/dev/null || echo "")
+            FS_MAJOR="${FS_VER%%.*}"
+            if [ -n "$FS_MAJOR" ] && [ "$FS_MAJOR" -ge 7 ] 2>/dev/null; then
+              echo "::notice::@capacitor/filesystem $FS_VER cannot link for Mac Catalyst (IONFilesystemLib.xcframework has no maccatalyst slice) — pinning v6 so the feature survives."
+              (cd ../.. && npm install @capacitor/filesystem@^6.0.4 --legacy-peer-deps) || echo "::warning::filesystem downgrade failed — the pod will be stripped and the guard below will stop the build."
+            fi
+          fi
+
           if [ ! -f "Podfile" ]; then
             echo "platform :ios, '15.0'" > Podfile
             echo "target 'App' do" >> Podfile
@@ -510,8 +543,13 @@ jobs:
             pod install || pod install --repo-update
           fi
           
-          sed -i.bak '/IONFilesystemLib/d' Podfile
-          sed -i.bak '/CapacitorFilesystem/d' Podfile
+          # Only amputate Filesystem if the pin above did not take effect — a v6
+          # podspec has no IONFilesystemLib dependency and links fine.
+          if grep -qs "IONFilesystemLib" ../../node_modules/@capacitor/filesystem/CapacitorFilesystem.podspec; then
+            echo "::warning::stripping CapacitorFilesystem — every Filesystem call in this binary will fail at runtime."
+            sed -i.bak '/IONFilesystemLib/d' Podfile
+            sed -i.bak '/CapacitorFilesystem/d' Podfile
+          fi
           sed -i.bak '/Google-Mobile-Ads-SDK/d' Podfile
           sed -i.bak '/GoogleUserMessagingPlatform/d' Podfile
           sed -i.bak '/CapacitorCommunityAdmob/d' Podfile
@@ -540,45 +578,42 @@ jobs:
         if: inputs.target_platform == 'all_devices' || inputs.target_platform == 'macos_only'
         working-directory: app
         run: |
-          # The step above DELETES pods that cannot be linked for Mac Catalyst.
-          # That deletion is mandatory, not a shortcut — MEASURED 2026-07-27:
-          # @capacitor/filesystem v7+ depends on IONFilesystemLib, which ships as
-          # a prebuilt .xcframework carrying only `ios-arm64` and
-          # `ios-arm64_x86_64-simulator` slices. There is no maccatalyst slice, so
-          # no build setting can make it link. Same story for the AdMob SDKs.
+          # Last line of defence for the failure mode that cost real money twice:
+          # a pod this job removed, whose JS the app still calls. `cap sync` leaves
+          # the plugin in packageClassList either way, so the app asks Capacitor
+          # for a class that is not in the binary and every call fails at runtime
+          # with `"X" plugin is not implemented on ios` — in a paid feature, with
+          # nothing in the build log, on Mac AND in the iOS ipa.
           #
-          # The danger is what happens NEXT. `cap sync` still writes the plugin
-          # into packageClassList, so the app asks Capacitor for a class that is
-          # not in the binary and every call fails at runtime with
-          # `"X" plugin is not implemented on ios` — in a paid feature, with
-          # nothing in the build log. And it is not only the Mac app: this job
-          # removes the SPM package and builds BOTH archives from these Pods, so
-          # the iOS ipa loses the framework too (verified by inspecting the built
-          # bundle: CapacitorShare/Preferences/App present, CapacitorFilesystem
-          # absent). That is how MHT Viewer shipped with saving-a-part, the
-          # archive save path and the whole Batch Convert sheet dead, and how the
-          # AdMob revenue went to zero before it.
+          # Ask the only question that matters: does src/ import a package whose
+          # pod is missing from the Podfile we are about to build? That stays
+          # correct as the Podfile changes — when the v6 pin above works,
+          # CapacitorFilesystem is present and this passes.
           #
-          # So: if the app's own source still calls one of these, stop. Mark a
-          # file MAC-STRIPPED-OK when the import is a browser-only fallback and
-          # the native path goes through the app's own plugin instead — see
-          # mht-viewer-converter src/lib/cache-file.ts.
-          STRIPPED="@capacitor/filesystem @capacitor-community/admob"
+          # A file whose import is a browser-only fallback (native path goes
+          # through the app's own plugin) opts out with a MAC-STRIPPED-OK comment
+          # — see mht-viewer-converter src/lib/cache-file.ts.
+          PODFILE="ios/App/Podfile"
+          [ -f "$PODFILE" ] || exit 0
           FAIL=0
-          for pkg in $STRIPPED; do
+          check() {
+            NPM_PKG="$1"; POD_NAME="$2"
+            grep -qs "pod '$POD_NAME'" "$PODFILE" && return 0
             OFFENDERS=""
-            for f in $(grep -rls --include="*.ts" --include="*.tsx" --include="*.js" --include="*.jsx" --include="*.vue" "$pkg" src/ 2>/dev/null); do
+            for f in $(grep -rls --include="*.ts" --include="*.tsx" --include="*.js" --include="*.jsx" --include="*.vue" "$NPM_PKG" src/ 2>/dev/null); do
               grep -q "MAC-STRIPPED-OK" "$f" || OFFENDERS="$OFFENDERS $f"
             done
-            if [ -n "$OFFENDERS" ]; then
-              echo "::error::$pkg cannot be linked for Mac Catalyst and is being stripped from this build, but src/ still calls it:$OFFENDERS -- every call will fail at runtime with '\"plugin is not implemented on ios\"', on Mac AND on iPhone. Fix: write through your own native plugin method (pattern: mht-viewer-converter MHTEnginePlugin.writeCacheFile + src/lib/cache-file.ts), or build this app without Mac. If the import really is a web-only fallback, add a MAC-STRIPPED-OK comment to the file."
-              FAIL=1
-            fi
-          done
+            [ -z "$OFFENDERS" ] && return 0
+            echo "::error::$NPM_PKG is imported by src/ but $POD_NAME is not in the Podfile for this build, so the binary ships WITHOUT it and every call fails at runtime with '\"plugin is not implemented on ios\"' — on Mac and on iPhone. Offending files:$OFFENDERS"
+            FAIL=1
+          }
+          check "@capacitor/filesystem" "CapacitorFilesystem"
+          check "@capacitor-community/admob" "CapacitorCommunityAdmob"
           if [ "$FAIL" = "1" ]; then
             if [ "${{ inputs.allow_stripped_plugins }}" = "true" ]; then
               echo "::warning::allow_stripped_plugins is set — shipping with the feature above dead on every platform."
             else
+              echo "Fix options: (a) let the v6 pin work, (b) write through your own native plugin method (pattern: mht-viewer-converter MHTEnginePlugin.writeCacheFile + src/lib/cache-file.ts), (c) build this app without Mac, or (d) re-run with allow_stripped_plugins to ship the feature dead."
               exit 1
             fi
           fi
