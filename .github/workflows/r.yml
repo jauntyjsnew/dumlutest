@@ -63,6 +63,12 @@ on:
         type: string
         default: 'public.app-category.utilities'
 
+      allow_stripped_plugins:
+        description: 'Ship even if src/ calls a plugin Catalyst cannot link (dead feature)'
+        required: false
+        type: boolean
+        default: false
+
 jobs:
   build:
     runs-on: macos-latest
@@ -529,6 +535,53 @@ jobs:
           echo 'end' >> Podfile
           
           pod install
+      
+      - name: Stripped Plugin Guard
+        if: inputs.target_platform == 'all_devices' || inputs.target_platform == 'macos_only'
+        working-directory: app
+        run: |
+          # The step above DELETES pods that cannot be linked for Mac Catalyst.
+          # That deletion is mandatory, not a shortcut — MEASURED 2026-07-27:
+          # @capacitor/filesystem v7+ depends on IONFilesystemLib, which ships as
+          # a prebuilt .xcframework carrying only `ios-arm64` and
+          # `ios-arm64_x86_64-simulator` slices. There is no maccatalyst slice, so
+          # no build setting can make it link. Same story for the AdMob SDKs.
+          #
+          # The danger is what happens NEXT. `cap sync` still writes the plugin
+          # into packageClassList, so the app asks Capacitor for a class that is
+          # not in the binary and every call fails at runtime with
+          # `"X" plugin is not implemented on ios` — in a paid feature, with
+          # nothing in the build log. And it is not only the Mac app: this job
+          # removes the SPM package and builds BOTH archives from these Pods, so
+          # the iOS ipa loses the framework too (verified by inspecting the built
+          # bundle: CapacitorShare/Preferences/App present, CapacitorFilesystem
+          # absent). That is how MHT Viewer shipped with saving-a-part, the
+          # archive save path and the whole Batch Convert sheet dead, and how the
+          # AdMob revenue went to zero before it.
+          #
+          # So: if the app's own source still calls one of these, stop. Mark a
+          # file MAC-STRIPPED-OK when the import is a browser-only fallback and
+          # the native path goes through the app's own plugin instead — see
+          # mht-viewer-converter src/lib/cache-file.ts.
+          STRIPPED="@capacitor/filesystem @capacitor-community/admob"
+          FAIL=0
+          for pkg in $STRIPPED; do
+            OFFENDERS=""
+            for f in $(grep -rls --include="*.ts" --include="*.tsx" --include="*.js" --include="*.jsx" --include="*.vue" "$pkg" src/ 2>/dev/null); do
+              grep -q "MAC-STRIPPED-OK" "$f" || OFFENDERS="$OFFENDERS $f"
+            done
+            if [ -n "$OFFENDERS" ]; then
+              echo "::error::$pkg cannot be linked for Mac Catalyst and is being stripped from this build, but src/ still calls it:$OFFENDERS -- every call will fail at runtime with '\"plugin is not implemented on ios\"', on Mac AND on iPhone. Fix: write through your own native plugin method (pattern: mht-viewer-converter MHTEnginePlugin.writeCacheFile + src/lib/cache-file.ts), or build this app without Mac. If the import really is a web-only fallback, add a MAC-STRIPPED-OK comment to the file."
+              FAIL=1
+            fi
+          done
+          if [ "$FAIL" = "1" ]; then
+            if [ "${{ inputs.allow_stripped_plugins }}" = "true" ]; then
+              echo "::warning::allow_stripped_plugins is set — shipping with the feature above dead on every platform."
+            else
+              exit 1
+            fi
+          fi
       
       - name: Pods Target
         working-directory: app/ios/App
