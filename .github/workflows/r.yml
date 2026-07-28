@@ -491,6 +491,8 @@ jobs:
       - name: Catalyst Pods
         if: inputs.target_platform == 'all_devices' || inputs.target_platform == 'macos_only'
         working-directory: app/ios/App
+        env:
+          CAP_MAJOR: ${{ steps.node_version.outputs.capacitor_major }}
         run: |
           # ── Keep @capacitor/filesystem linkable for Mac ──────────────────
           # MEASURED 2026-07-27. @capacitor/filesystem v7+ depends on
@@ -560,18 +562,39 @@ jobs:
             rm -f Podfile.bak
           fi
           
+          # IPHONEOS_DEPLOYMENT_TARGET belongs in post_install, not only in the
+          # `Pods Target` step below. MEASURED 2026-07-28 (GPXview run
+          # 30367343655): a later `pod install` — the one inside Build App's
+          # prepare_geolocation_for_catalyst — regenerates Pods.xcodeproj and
+          # throws away everything that step wrote, so every pod falls back to
+          # its own podspec minimum. @capacitor/filesystem 6.0.4 declares
+          # `s.ios.deployment_target = '13.0'`, which for Catalyst becomes
+          # ios13.1-macabi, and at that target Xcode 26.6 does not emit an
+          # error — swift-frontend CRASHES type-checking Filesystem.swift:253
+          # (`Assertion failed: (inserted), addFix, ConstraintSystem.cpp:350`)
+          # and the Mac archive dies. Reproduced locally both ways: the same
+          # pod builds clean at ios15.0-macabi and crashes at ios13.1-macabi.
+          # Setting it here makes it survive any number of later pod installs.
+          # CODE_SIGN_STYLE is here for the same reason — `Pods Sign` writes it
+          # into the project and that later pod install would drop it.
+          if [ "$CAP_MAJOR" -ge 6 ] 2>/dev/null; then IOS_TARGET="15.0"
+          elif [ "$CAP_MAJOR" -eq 5 ] 2>/dev/null; then IOS_TARGET="13.0"
+          else IOS_TARGET="15.0"; fi
+
           echo '' >> Podfile
           echo 'post_install do |installer|' >> Podfile
           echo '  installer.pods_project.targets.each do |target|' >> Podfile
           echo '    target.build_configurations.each do |config|' >> Podfile
           echo '      config.build_settings["SUPPORTS_MACCATALYST"] = "YES"' >> Podfile
+          echo "      config.build_settings[\"IPHONEOS_DEPLOYMENT_TARGET\"] = \"$IOS_TARGET\"" >> Podfile
           echo '      config.build_settings["CODE_SIGN_IDENTITY"] = ""' >> Podfile
+          echo '      config.build_settings["CODE_SIGN_STYLE"] = "Manual"' >> Podfile
           echo '      config.build_settings["CODE_SIGNING_REQUIRED"] = "NO"' >> Podfile
           echo '      config.build_settings["CODE_SIGNING_ALLOWED"] = "NO"' >> Podfile
           echo '    end' >> Podfile
           echo '  end' >> Podfile
           echo 'end' >> Podfile
-          
+
           pod install
       
       - name: Stripped Plugin Guard
@@ -863,6 +886,10 @@ jobs:
             if [ -f "$GEO_PODSPEC" ] && grep -q "IONGeolocationLib" "$GEO_PODSPEC"; then
               sed -i.bak "/IONGeolocationLib/d" "$GEO_PODSPEC"
               rm -f "$GEO_PODSPEC.bak"
+              # This pod install regenerates Pods.xcodeproj and discards what
+              # the `Pods Target` / `Pods Sign` steps wrote into it. That is why
+              # deployment target and signing style now live in the Podfile's
+              # post_install (see `Catalyst Pods`) — do not move them back.
               if [ -f "Podfile" ]; then pod install; fi
             fi
           }
