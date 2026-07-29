@@ -967,6 +967,14 @@ jobs:
                 end
               else
                 config.build_settings['CODE_SIGN_STYLE'] = 'Automatic'
+                # Automatic signing picks the PROFILE TYPE from the identity.
+                # Leaving the target default ("Apple Development") made Xcode ask
+                # for an iOS App Development profile, which requires registered
+                # devices — CI has none, so the archive failed with "your team has
+                # no devices". Distribution profiles need no devices.
+                config.build_settings['CODE_SIGN_IDENTITY'] = 'Apple Distribution'
+                config.build_settings['CODE_SIGN_IDENTITY[sdk=iphoneos*]'] = 'Apple Distribution'
+                config.build_settings['CODE_SIGN_IDENTITY[sdk=macosx*]'] = 'Apple Distribution'
                 config.build_settings.delete('PROVISIONING_PROFILE')
                 config.build_settings.delete('PROVISIONING_PROFILE_SPECIFIER')
               end
@@ -1101,10 +1109,33 @@ jobs:
             export FASTLANE_XCODEBUILD_SETTINGS_RETRIES=6
             
             if [ "${{ inputs.target_platform }}" != "macos_only" ]; then
-              fastlane run build_app \
-                $FL_ARG scheme:"App" export_method:"app-store" \
-                output_directory:"." output_name:"${APP_NAME_SAFE}-iOS.ipa" \
-                export_team_id:"$TEAM_ID" xcargs:"$XCARGS" clean:true silent:true
+              # Same reasoning as the Mac export below: with extensions in the
+              # archive, a manual profile map would have to name a profile for
+              # every bundle id and only the app's exists. Let Xcode resolve
+              # them, using the profiles it just created during the archive.
+              if [ -n "${EXT_TARGETS:-}" ]; then
+                {
+                  echo '<?xml version="1.0" encoding="UTF-8"?>'
+                  echo '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">'
+                  echo '<plist version="1.0"><dict>'
+                  echo '    <key>method</key><string>app-store</string>'
+                  echo "    <key>teamID</key><string>$TEAM_ID</string>"
+                  echo '    <key>signingStyle</key><string>automatic</string>'
+                  echo '    <key>uploadSymbols</key><true/>'
+                  echo '</dict></plist>'
+                } > iOSExportOptions.plist
+                fastlane run build_app \
+                  $FL_ARG scheme:"App" \
+                  output_directory:"." output_name:"${APP_NAME_SAFE}-iOS.ipa" \
+                  export_team_id:"$TEAM_ID" xcargs:"$XCARGS" \
+                  skip_profile_detection:true export_options:"iOSExportOptions.plist" \
+                  clean:true silent:true
+              else
+                fastlane run build_app \
+                  $FL_ARG scheme:"App" export_method:"app-store" \
+                  output_directory:"." output_name:"${APP_NAME_SAFE}-iOS.ipa" \
+                  export_team_id:"$TEAM_ID" xcargs:"$XCARGS" clean:true silent:true
+              fi
             fi
 
             if [ "${{ inputs.target_platform }}" == "macos_only" ] || [ "${{ inputs.target_platform }}" == "all_devices" ]; then
