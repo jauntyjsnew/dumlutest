@@ -1011,17 +1011,20 @@ jobs:
               output_path:"$RUNNER_TEMP" filename:"$OUT_BASE" \
               2>&1 | tee "$RUNNER_TEMP/sigh.log" | tail -6
           }
+          # Sets INSTALLED_UUID rather than printing it. Returning the uuid on
+          # stdout swallowed the ::add-mask:: line into the same capture, so the
+          # caller got two lines and GITHUB_OUTPUT rejected the multi-line value
+          # ("Invalid format"). A mask directive only counts on stdout, so it
+          # cannot be moved to stderr either.
           install_profile() {
             local FILE="$1" PLAT="$2"
-            local U
-            U=$(/usr/libexec/PlistBuddy -c "Print UUID" /dev/stdin <<< $(security cms -D -i "$FILE"))
-            echo "::add-mask::$U"
+            INSTALLED_UUID=$(/usr/libexec/PlistBuddy -c "Print UUID" /dev/stdin <<< $(security cms -D -i "$FILE"))
+            echo "::add-mask::$INSTALLED_UUID"
             if [ "$PLAT" = "macos" ]; then
-              cp "$FILE" ~/Library/MobileDevice/Provisioning\ Profiles/$U.provisionprofile
+              cp "$FILE" ~/Library/MobileDevice/Provisioning\ Profiles/$INSTALLED_UUID.provisionprofile
             else
-              cp "$FILE" ~/Library/MobileDevice/Provisioning\ Profiles/$U.mobileprovision
+              cp "$FILE" ~/Library/MobileDevice/Provisioning\ Profiles/$INSTALLED_UUID.mobileprovision
             fi
-            printf '%s' "$U"
           }
 
           if [ -z "$APP_IOS_UUID" ]; then
@@ -1029,7 +1032,8 @@ jobs:
             if ! fetch_profile "$BUNDLE_ID" ios "App_ios.mobileprovision"; then
               echo "::error::could not obtain the app's iOS App Store profile - see the fastlane error above"; exit 1
             fi
-            APP_IOS_UUID=$(install_profile "$RUNNER_TEMP/App_ios.mobileprovision" ios)
+            install_profile "$RUNNER_TEMP/App_ios.mobileprovision" ios
+            APP_IOS_UUID="$INSTALLED_UUID"
             echo "  app iOS profile ready"
           else
             echo "── app iOS profile supplied in the dispatch inputs ──"
@@ -1040,7 +1044,8 @@ jobs:
             if ! fetch_profile "$BUNDLE_ID" macos "App_macos.mobileprovision"; then
               echo "::error::could not obtain the app's Mac App Store profile - see the fastlane error above"; exit 1
             fi
-            APP_MAC_UUID=$(install_profile "$RUNNER_TEMP/App_macos.mobileprovision" macos)
+            install_profile "$RUNNER_TEMP/App_macos.mobileprovision" macos
+            APP_MAC_UUID="$INSTALLED_UUID"
             echo "  app Mac profile ready"
           elif [ "$NEED_MAC" = "true" ]; then
             echo "── app Mac profile supplied in the dispatch inputs ──"
