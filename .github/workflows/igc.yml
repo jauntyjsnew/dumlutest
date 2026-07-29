@@ -15,10 +15,16 @@
 #      pod install all rewrite App.xcodeproj. If one drops an extension the app
 #      still builds and still ships, minus Quick Look. Fail instead.
 #   3. Catalyst on every target, not just App.
-#   4. App keeps its manual profile; extensions move to automatic signing,
-#      because a profile is valid for one App ID and they have their own.
-#   5. Archive gets -allowProvisioningUpdates + the ASC API key so Xcode can
-#      create those profiles; Mac export switches to automatic signing.
+#   4. "Extension Profiles" — r.yml signs one bundle id with the profile pasted
+#      into the dispatch inputs. Extensions have their own bundle ids and no
+#      profiles exist for them. Rather than making every release paste four more
+#      base64 blobs, the App Store Connect API key already present for the
+#      upload creates the identifiers and App Store profiles itself.
+#   5. Everything stays MANUALLY signed, app and extensions alike. Automatic
+#      signing was tried and cannot work here: it resolves to development, then
+#      rejects an explicit Apple Distribution identity as conflicting, and a
+#      development profile needs registered devices a CI runner does not have.
+#      Both exports name a profile for every bundle id in the archive.
 
 name: IGC
 
@@ -937,6 +943,100 @@ jobs:
           echo "TEAM_ID=$TEAM_ID" >> $GITHUB_ENV
           echo "APP_NAME_SAFE=$APP_NAME_SAFE" >> $GITHUB_ENV
       
+      # ─── Provisioning for the app extensions ──────────────────────────
+      # r.yml signs exactly one bundle id, with the profile pasted into the
+      # dispatch inputs. This app adds two more — the Quick Look preview and the
+      # thumbnail provider each get their own bundle id — and nothing has ever
+      # created profiles for those. Rather than making every release of this one
+      # app paste four extra base64 blobs, the App Store Connect API key that is
+      # already here for the upload creates the identifiers and the App Store
+      # profiles itself. Idempotent: an identifier that exists is reused, and a
+      # valid profile is downloaded rather than regenerated.
+      - name: Extension Profiles
+        id: ext_profiles
+        if: inputs.build_mode == 'publish_to_appstore'
+        working-directory: app/ios/App
+        run: |
+          set -uo pipefail
+          gem install xcodeproj --no-document >/dev/null 2>&1 || true
+          MAP=$(ruby -e '
+            require "xcodeproj"
+            require "json"
+            project = Xcodeproj::Project.open("App.xcodeproj")
+            out = {}
+            project.targets.each do |t|
+              next if t.name == "App"
+              next unless t.respond_to?(:product_type) && t.product_type.to_s.include?("app-extension")
+              cfg = t.build_configurations.find { |c| c.name == "Release" } || t.build_configurations.first
+              id = cfg && cfg.build_settings["PRODUCT_BUNDLE_IDENTIFIER"]
+              out[t.name] = id if id && !id.to_s.empty?
+            end
+            print out.to_json
+          ')
+          echo "extension targets: $MAP"
+          if [ "$MAP" = "{}" ] || [ -z "$MAP" ]; then
+            echo "no app extensions - nothing to provision"
+            echo "map={}" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          API_KEY_CONTENT=$(echo "${{ steps.apple.outputs.api_key_base64 }}" | base64 --decode)
+          API_KEY_PATH="$RUNNER_TEMP/ext_api_key.json"
+          jq -n --arg key_id "${{ steps.apple.outputs.api_key_id }}" \
+                --arg issuer_id "${{ steps.apple.outputs.api_issuer_id }}" \
+                --arg key "$API_KEY_CONTENT" \
+                '{key_id: $key_id, issuer_id: $issuer_id, key: $key, in_house: false}' > "$API_KEY_PATH"
+          export SPACESHIP_SKIP_2FA_UPGRADE=1
+          mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
+          NEED_MAC=false
+          if [ "${{ inputs.target_platform }}" = "all_devices" ] || [ "${{ inputs.target_platform }}" = "macos_only" ]; then
+            NEED_MAC=true
+          fi
+
+          RESULT='{}'
+          for TARGET in $(echo "$MAP" | jq -r 'keys[]'); do
+            EXT_ID=$(echo "$MAP" | jq -r --arg t "$TARGET" '.[$t]')
+            echo "── $TARGET ($EXT_ID) ──"
+
+            # Developer Portal identifier. skip_itc: an extension is not an app,
+            # it must not appear in App Store Connect.
+            fastlane run produce \
+              api_key_path:"$API_KEY_PATH" \
+              app_identifier:"$EXT_ID" app_name:"$TARGET" \
+              team_id:"${{ steps.apple.outputs.team_id }}" \
+              skip_itc:true 2>&1 | tail -4 || echo "identifier already exists - continuing"
+
+            for PLAT in ios macos; do
+              if [ "$PLAT" = "macos" ] && [ "$NEED_MAC" != "true" ]; then continue; fi
+              EXT_FILE="$RUNNER_TEMP/${TARGET}_${PLAT}.mobileprovision"
+              if ! fastlane run get_provisioning_profile \
+                    api_key_path:"$API_KEY_PATH" \
+                    app_identifier:"$EXT_ID" platform:"$PLAT" \
+                    team_id:"${{ steps.apple.outputs.team_id }}" \
+                    readonly:false skip_install:true \
+                    filename:"$EXT_FILE" 2>&1 | tail -6; then
+                echo "::error::could not create an App Store profile for $EXT_ID ($PLAT). If this says the key is unauthorised, the App Store Connect API key needs the Admin or App Manager role so it can create identifiers and profiles."
+                exit 1
+              fi
+              [ -f "$EXT_FILE" ] || EXT_FILE=$(ls -t *.mobileprovision 2>/dev/null | head -1)
+              if [ ! -f "$EXT_FILE" ]; then
+                echo "::error::profile for $EXT_ID ($PLAT) was not written"; exit 1
+              fi
+              EXT_UUID=$(/usr/libexec/PlistBuddy -c "Print UUID" /dev/stdin <<< $(security cms -D -i "$EXT_FILE"))
+              echo "::add-mask::$EXT_UUID"
+              if [ "$PLAT" = "macos" ]; then
+                cp "$EXT_FILE" ~/Library/MobileDevice/Provisioning\ Profiles/$EXT_UUID.provisionprofile
+              else
+                cp "$EXT_FILE" ~/Library/MobileDevice/Provisioning\ Profiles/$EXT_UUID.mobileprovision
+              fi
+              RESULT=$(echo "$RESULT" | jq --arg t "$TARGET" --arg p "$PLAT" --arg u "$EXT_UUID" --arg b "$EXT_ID" \
+                '.[$t] = ((.[$t] // {}) + {($p): $u, "bundle_id": $b})')
+              echo "  $PLAT profile installed"
+            done
+          done
+          echo "map=$(echo "$RESULT" | jq -c .)" >> $GITHUB_OUTPUT
+          echo "provisioned: $(echo "$RESULT" | jq -r 'keys | join(", ")')"
+
       - name: Manual Sign
         if: inputs.build_mode == 'publish_to_appstore'
         working-directory: app/ios/App
@@ -951,8 +1051,10 @@ jobs:
           # extensions take exactly the path they took before.
           cat > sign_targets.rb <<'RUBY'
           require 'xcodeproj'
+          require 'json'
           project = Xcodeproj::Project.open('App.xcodeproj')
           team = ENV['TEAM_ID']
+          EXT_MAP = JSON.parse(ENV['EXT_MAP'] || '{}')
           ext_targets = []
           project.targets.each do |target|
             is_app = target.name == 'App'
@@ -966,17 +1068,22 @@ jobs:
                   config.build_settings['PROVISIONING_PROFILE_SPECIFIER'] = ''
                 end
               else
-                config.build_settings['CODE_SIGN_STYLE'] = 'Automatic'
-                # Automatic signing picks the PROFILE TYPE from the identity.
-                # Leaving the target default ("Apple Development") made Xcode ask
-                # for an iOS App Development profile, which requires registered
-                # devices — CI has none, so the archive failed with "your team has
-                # no devices". Distribution profiles need no devices.
+                # Manual, exactly like the app — automatic signing cannot be told
+                # to use a distribution profile (it resolves development and then
+                # rejects an explicit Apple Distribution identity as conflicting),
+                # and it needs registered devices CI does not have. The profiles
+                # were created by the Extension Profiles step above.
+                ext = EXT_MAP[target.name]
+                config.build_settings['CODE_SIGN_STYLE'] = 'Manual'
                 config.build_settings['CODE_SIGN_IDENTITY'] = 'Apple Distribution'
-                config.build_settings['CODE_SIGN_IDENTITY[sdk=iphoneos*]'] = 'Apple Distribution'
-                config.build_settings['CODE_SIGN_IDENTITY[sdk=macosx*]'] = 'Apple Distribution'
-                config.build_settings.delete('PROVISIONING_PROFILE')
-                config.build_settings.delete('PROVISIONING_PROFILE_SPECIFIER')
+                config.build_settings['DEVELOPMENT_TEAM'] = team
+                if ext && ext['ios']
+                  config.build_settings['PROVISIONING_PROFILE'] = ext['ios']
+                  config.build_settings['PROVISIONING_PROFILE_SPECIFIER'] = ''
+                end
+                if ext && ext['macos']
+                  config.build_settings['PROVISIONING_PROFILE[sdk=macosx*]'] = ext['macos']
+                end
               end
             end
             ext_targets << target.name unless is_app
@@ -985,7 +1092,9 @@ jobs:
           File.write(ENV['GITHUB_ENV'], "EXT_TARGETS=#{ext_targets.join(',')}\n", mode: 'a')
           puts ext_targets.empty? ? 'no app extensions' : "extensions on automatic signing: #{ext_targets.join(', ')}"
           RUBY
-          TEAM_ID='${{ steps.apple.outputs.team_id }}' ruby sign_targets.rb
+          TEAM_ID='${{ steps.apple.outputs.team_id }}' \
+          EXT_MAP='${{ steps.ext_profiles.outputs.map }}' \
+            ruby sign_targets.rb
           rm sign_targets.rb
 
       - name: Build App
@@ -1092,36 +1201,35 @@ jobs:
           else
             TEAM_ID="${{ steps.apple.outputs.team_id }}"
             XCARGS="DEVELOPMENT_TEAM=$TEAM_ID CODE_SIGNING_REQUIRED=YES CODE_SIGNING_ALLOWED=YES"
-            # Extensions signed automatically need Xcode to be allowed to create
-            # their profiles; the API key is already here for the upload.
-            if [ -n "${EXT_TARGETS:-}" ]; then
-              API_KEY_DIR="$HOME/private_keys"
-              mkdir -p "$API_KEY_DIR"
-              echo "${{ steps.apple.outputs.api_key_base64 }}" | base64 --decode \
-                > "$API_KEY_DIR/AuthKey_${{ steps.apple.outputs.api_key_id }}.p8"
-              XCARGS="$XCARGS -allowProvisioningUpdates \
-                -authenticationKeyPath $API_KEY_DIR/AuthKey_${{ steps.apple.outputs.api_key_id }}.p8 \
-                -authenticationKeyID ${{ steps.apple.outputs.api_key_id }} \
-                -authenticationKeyIssuerID ${{ steps.apple.outputs.api_issuer_id }}"
-              echo "app extensions present ($EXT_TARGETS) - provisioning updates enabled"
-            fi
             export FASTLANE_XCODEBUILD_SETTINGS_TIMEOUT=120
             export FASTLANE_XCODEBUILD_SETTINGS_RETRIES=6
             
+            EXT_MAP_JSON='${{ steps.ext_profiles.outputs.map }}'
+            # Both exports need a profile named for EVERY bundle id in the
+            # archive. The app's comes from the dispatch input; the extensions'
+            # were created by the Extension Profiles step.
+            emit_profiles() {
+              local PLAT="$1" APP_UUID="$2"
+              echo '    <key>signingStyle</key><string>manual</string>'
+              echo '    <key>provisioningProfiles</key><dict>'
+              echo "        <key>$BUNDLE_ID</key><string>$APP_UUID</string>"
+              if [ -n "${EXT_MAP_JSON:-}" ] && [ "$EXT_MAP_JSON" != "{}" ]; then
+                echo "$EXT_MAP_JSON" | jq -r --arg p "$PLAT" \
+                  'to_entries[] | select(.value[$p] != null) |
+                   "        <key>\(.value.bundle_id)</key><string>\(.value[$p])</string>"'
+              fi
+              echo '    </dict>'
+            }
+
             if [ "${{ inputs.target_platform }}" != "macos_only" ]; then
-              # Same reasoning as the Mac export below: with extensions in the
-              # archive, a manual profile map would have to name a profile for
-              # every bundle id and only the app's exists. Let Xcode resolve
-              # them, using the profiles it just created during the archive.
-              if [ -n "${EXT_TARGETS:-}" ]; then
+              if [ -n "${EXT_MAP_JSON:-}" ] && [ "$EXT_MAP_JSON" != "{}" ]; then
                 {
                   echo '<?xml version="1.0" encoding="UTF-8"?>'
                   echo '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">'
                   echo '<plist version="1.0"><dict>'
                   echo '    <key>method</key><string>app-store</string>'
                   echo "    <key>teamID</key><string>$TEAM_ID</string>"
-                  echo '    <key>signingStyle</key><string>automatic</string>'
-                  echo '    <key>uploadSymbols</key><true/>'
+                  emit_profiles ios "${{ steps.provision.outputs.uuid }}"
                   echo '</dict></plist>'
                 } > iOSExportOptions.plist
                 fastlane run build_app \
@@ -1154,16 +1262,7 @@ jobs:
               echo '    <key>method</key><string>app-store</string>' >> MacExportOptions.plist
               echo "    <key>teamID</key><string>$TEAM_ID</string>" >> MacExportOptions.plist
               echo '    <key>destination</key><string>export</string>' >> MacExportOptions.plist
-              # provisioningProfiles must name a profile for EVERY bundle id in
-              # the archive, extensions included. Only the app's is available.
-              if [ -n "${EXT_TARGETS:-}" ]; then
-                echo '    <key>signingStyle</key><string>automatic</string>' >> MacExportOptions.plist
-              else
-                echo '    <key>signingStyle</key><string>manual</string>' >> MacExportOptions.plist
-                echo '    <key>provisioningProfiles</key><dict>' >> MacExportOptions.plist
-                echo "        <key>$BUNDLE_ID</key><string>$MAC_PROFILE_UUID</string>" >> MacExportOptions.plist
-                echo '    </dict>' >> MacExportOptions.plist
-              fi
+              emit_profiles macos "$MAC_PROFILE_UUID" >> MacExportOptions.plist
               echo '</dict></plist>' >> MacExportOptions.plist
               
               MAC_XCARGS="DEVELOPMENT_TEAM=$TEAM_ID CODE_SIGNING_REQUIRED=YES CODE_SIGNING_ALLOWED=YES PROVISIONING_PROFILE='' PROVISIONING_PROFILE_SPECIFIER=''"
