@@ -1334,6 +1334,10 @@ jobs:
             export FASTLANE_XCODEBUILD_SETTINGS_RETRIES=6
             
             EXT_MAP_JSON='${{ steps.ext_profiles.outputs.map }}'
+            # Defined here, not inside the Mac branch: the iOS export runs
+            # first and was building its profile map with an empty key,
+            # which Xcode rejects as a malformed export options plist.
+            BUNDLE_ID="${{ steps.capacitor.outputs.bundle_id }}"
             # Both exports need a profile named for EVERY bundle id in the
             # archive. The app's comes from the dispatch input or is fetched;
             # the extensions' were created by the Extension Profiles step.
@@ -1343,6 +1347,12 @@ jobs:
             write_export_options() {
               local PLAT="$1" APP_UUID="$2" OUT="$3"
               local PROFILES
+              if [ -z "$BUNDLE_ID" ]; then
+                echo "::error::BUNDLE_ID is empty - the export map would carry a blank key"; exit 1
+              fi
+              if [ -z "$APP_UUID" ]; then
+                echo "::error::no profile uuid for the app ($PLAT)"; exit 1
+              fi
               PROFILES=$(jq -n --arg b "$BUNDLE_ID" --arg u "$APP_UUID" '{($b): $u}')
               if [ -n "${EXT_MAP_JSON:-}" ] && [ "$EXT_MAP_JSON" != "{}" ]; then
                 PROFILES=$(echo "$EXT_MAP_JSON" | jq --argjson base "$PROFILES" --arg p "$PLAT" \
@@ -1388,7 +1398,6 @@ jobs:
                 echo "::error::no Mac profile - neither pasted nor fetched"; exit 1
               fi
               
-              BUNDLE_ID="${{ steps.capacitor.outputs.bundle_id }}"
               INSTALLER_CERT_NAME="${{ steps.cert.outputs.installer_cert_name }}"
               
               write_export_options macos "$MAC_PROFILE_UUID" MacExportOptions.plist
