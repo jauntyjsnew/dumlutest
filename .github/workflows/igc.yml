@@ -986,6 +986,7 @@ jobs:
                 --arg issuer_id "${{ steps.apple.outputs.api_issuer_id }}" \
                 --arg key "$API_KEY_CONTENT" \
                 '{key_id: $key_id, issuer_id: $issuer_id, key: $key, in_house: false}' > "$API_KEY_PATH"
+          echo "$API_KEY_CONTENT" > "$RUNNER_TEMP/ext_key.p8"
           export SPACESHIP_SKIP_2FA_UPGRADE=1
           mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
           NEED_MAC=false
@@ -998,13 +999,41 @@ jobs:
             EXT_ID=$(echo "$MAP" | jq -r --arg t "$TARGET" '.[$t]')
             echo "── $TARGET ($EXT_ID) ──"
 
-            # Developer Portal identifier. skip_itc: an extension is not an app,
-            # it must not appear in App Store Connect.
-            fastlane run produce \
-              api_key_path:"$API_KEY_PATH" \
-              app_identifier:"$EXT_ID" app_name:"$TARGET" \
-              team_id:"${{ steps.apple.outputs.team_id }}" \
-              skip_itc:true 2>&1 | tail -4 || echo "identifier already exists - continuing"
+            # Developer Portal identifier, via the Connect API directly.
+            # `produce` cannot do this: its option list has no api_key_path at
+            # all — it authenticates with a username and password, which this
+            # pipeline deliberately does not have. Spaceship's Connect API
+            # client does accept the key, so the bundle id is created with that.
+            # UNIVERSAL because the same identifier has to serve the iOS build
+            # and the Mac Catalyst one.
+            if ! EXT_ID="$EXT_ID" EXT_NAME="$TARGET" \
+                 API_KEY_ID="${{ steps.apple.outputs.api_key_id }}" \
+                 API_ISSUER="${{ steps.apple.outputs.api_issuer_id }}" \
+                 API_P8="$RUNNER_TEMP/ext_key.p8" \
+                 ruby -e '
+                   require "spaceship"
+                   token = Spaceship::ConnectAPI::Token.create(
+                     key_id: ENV["API_KEY_ID"],
+                     issuer_id: ENV["API_ISSUER"],
+                     filepath: ENV["API_P8"],
+                   )
+                   Spaceship::ConnectAPI.token = token
+                   id = ENV["EXT_ID"]
+                   found = (Spaceship::ConnectAPI::BundleId.find(id) rescue nil)
+                   found ||= (Spaceship::ConnectAPI::BundleId.all.find { |b| b.identifier == id } rescue nil)
+                   if found
+                     puts "identifier exists: #{id}"
+                   else
+                     Spaceship::ConnectAPI::BundleId.create(
+                       name: ENV["EXT_NAME"], identifier: id,
+                       platform: Spaceship::ConnectAPI::Platform::UNIVERSAL,
+                     )
+                     puts "identifier created: #{id}"
+                   end
+                 '; then
+              echo "::error::could not create the App ID $EXT_ID. The App Store Connect API key needs the Admin or App Manager role to create identifiers."
+              exit 1
+            fi
 
             for PLAT in ios macos; do
               if [ "$PLAT" = "macos" ] && [ "$NEED_MAC" != "true" ]; then continue; fi
