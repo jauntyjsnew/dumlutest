@@ -1049,18 +1049,20 @@ jobs:
             for PLAT in ios macos; do
               if [ "$PLAT" = "macos" ] && [ "$NEED_MAC" != "true" ]; then continue; fi
               EXT_FILE="$RUNNER_TEMP/${TARGET}_${PLAT}.mobileprovision"
-              # force:false is the point for a portfolio this size: sigh
-              # downloads an existing valid profile and only mints one when
-              # there is none or it has expired. The first release of an app
-              # creates them; every release after reuses them, so nothing
-              # accumulates against Apple's per-account profile limit.
+              # Neither force nor readonly is passed. fastlane run marshals
+              # booleans as strings, so even force:false counts as "given" and
+              # collides with readonly ("You can't enable both"). The defaults
+              # are already what a hundred-app pipeline wants: download an
+              # existing valid profile, mint one only when there is none or it
+              # has expired. First release creates, every release after reuses,
+              # and nothing accumulates against Apple's per-account limit.
               if ! fastlane run get_provisioning_profile \
                     api_key_path:"$API_KEY_PATH" \
                     app_identifier:"$EXT_ID" platform:"$PLAT" \
                     team_id:"${{ steps.apple.outputs.team_id }}" \
-                    readonly:false force:false skip_install:true \
+                    skip_install:true \
                     filename:"$EXT_FILE" 2>&1 | tee "$RUNNER_TEMP/sigh.log" | tail -6; then
-                echo "::error::could not create an App Store profile for $EXT_ID ($PLAT). If this says the key is unauthorised, the App Store Connect API key needs the Admin or App Manager role so it can create identifiers and profiles."
+                echo "::error::could not obtain an App Store profile for $EXT_ID ($PLAT) - read the fastlane error just above. Only if it mentions FORBIDDEN or authentication does the App Store Connect API key need a wider role."
                 exit 1
               fi
               [ -f "$EXT_FILE" ] || EXT_FILE=$(ls -t *.mobileprovision 2>/dev/null | head -1)
