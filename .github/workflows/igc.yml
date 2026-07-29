@@ -1048,7 +1048,12 @@ jobs:
 
             for PLAT in ios macos; do
               if [ "$PLAT" = "macos" ] && [ "$NEED_MAC" != "true" ]; then continue; fi
-              EXT_FILE="$RUNNER_TEMP/${TARGET}_${PLAT}.mobileprovision"
+              # filename must be a BARE name: sigh joins it onto the working
+              # directory, so an absolute path lands at app/ios/App/Users/... —
+              # the profile downloads fine and then cannot be found. The
+              # directory goes in output_path instead.
+              EXT_BASENAME="${TARGET}_${PLAT}.mobileprovision"
+              EXT_FILE="$RUNNER_TEMP/$EXT_BASENAME"
               # Neither force nor readonly is passed. fastlane run marshals
               # booleans as strings, so even force:false counts as "given" and
               # collides with readonly ("You can't enable both"). The defaults
@@ -1061,11 +1066,14 @@ jobs:
                     app_identifier:"$EXT_ID" platform:"$PLAT" \
                     team_id:"${{ steps.apple.outputs.team_id }}" \
                     skip_install:true \
-                    filename:"$EXT_FILE" 2>&1 | tee "$RUNNER_TEMP/sigh.log" | tail -6; then
+                    output_path:"$RUNNER_TEMP" filename:"$EXT_BASENAME" \
+                    2>&1 | tee "$RUNNER_TEMP/sigh.log" | tail -6; then
                 echo "::error::could not obtain an App Store profile for $EXT_ID ($PLAT) - read the fastlane error just above. Only if it mentions FORBIDDEN or authentication does the App Store Connect API key need a wider role."
                 exit 1
               fi
-              [ -f "$EXT_FILE" ] || EXT_FILE=$(ls -t *.mobileprovision 2>/dev/null | head -1)
+              if [ ! -f "$EXT_FILE" ]; then
+                EXT_FILE=$(find "$RUNNER_TEMP" . -name "$EXT_BASENAME" -type f 2>/dev/null | head -1)
+              fi
               if [ ! -f "$EXT_FILE" ]; then
                 echo "::error::profile for $EXT_ID ($PLAT) was not written"; exit 1
               fi
