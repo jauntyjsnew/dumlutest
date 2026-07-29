@@ -1024,26 +1024,42 @@ jobs:
                    if found
                      puts "identifier exists: #{id}"
                    else
+                     # The constant moved between fastlane versions - Platform
+                     # in some, BundleIdPlatform in others - and the API itself
+                     # only wants the string.
+                     plat = begin
+                       Spaceship::ConnectAPI::BundleIdPlatform::UNIVERSAL
+                     rescue NameError
+                       begin
+                         Spaceship::ConnectAPI::Platform::UNIVERSAL
+                       rescue NameError
+                         "UNIVERSAL"
+                       end
+                     end
                      Spaceship::ConnectAPI::BundleId.create(
-                       name: ENV["EXT_NAME"], identifier: id,
-                       platform: Spaceship::ConnectAPI::Platform::UNIVERSAL,
+                       name: ENV["EXT_NAME"], identifier: id, platform: plat,
                      )
                      puts "identifier created: #{id}"
                    end
                  '; then
-              echo "::error::could not create the App ID $EXT_ID. The App Store Connect API key needs the Admin or App Manager role to create identifiers."
+              echo "::error::could not create the App ID $EXT_ID - see the ruby error immediately above. If it mentions FORBIDDEN or authentication, the App Store Connect API key needs the Admin or App Manager role; anything else is a bug in this step, not a permissions problem."
               exit 1
             fi
 
             for PLAT in ios macos; do
               if [ "$PLAT" = "macos" ] && [ "$NEED_MAC" != "true" ]; then continue; fi
               EXT_FILE="$RUNNER_TEMP/${TARGET}_${PLAT}.mobileprovision"
+              # force:false is the point for a portfolio this size: sigh
+              # downloads an existing valid profile and only mints one when
+              # there is none or it has expired. The first release of an app
+              # creates them; every release after reuses them, so nothing
+              # accumulates against Apple's per-account profile limit.
               if ! fastlane run get_provisioning_profile \
                     api_key_path:"$API_KEY_PATH" \
                     app_identifier:"$EXT_ID" platform:"$PLAT" \
                     team_id:"${{ steps.apple.outputs.team_id }}" \
-                    readonly:false skip_install:true \
-                    filename:"$EXT_FILE" 2>&1 | tail -6; then
+                    readonly:false force:false skip_install:true \
+                    filename:"$EXT_FILE" 2>&1 | tee "$RUNNER_TEMP/sigh.log" | tail -6; then
                 echo "::error::could not create an App Store profile for $EXT_ID ($PLAT). If this says the key is unauthorised, the App Store Connect API key needs the Admin or App Manager role so it can create identifiers and profiles."
                 exit 1
               fi
@@ -1060,7 +1076,11 @@ jobs:
               fi
               RESULT=$(echo "$RESULT" | jq --arg t "$TARGET" --arg p "$PLAT" --arg u "$EXT_UUID" --arg b "$EXT_ID" \
                 '.[$t] = ((.[$t] // {}) + {($p): $u, "bundle_id": $b})')
-              echo "  $PLAT profile installed"
+              if grep -qi "Creating new provisioning profile" "$RUNNER_TEMP/sigh.log" 2>/dev/null; then
+                echo "  $PLAT: profile created"
+              else
+                echo "  $PLAT: existing profile reused"
+              fi
             done
           done
           echo "map=$(echo "$RESULT" | jq -c .)" >> $GITHUB_OUTPUT
