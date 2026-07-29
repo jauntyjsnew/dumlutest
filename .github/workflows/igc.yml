@@ -1041,7 +1041,10 @@ jobs:
 
           if [ "$NEED_MAC" = "true" ] && [ -z "$APP_MAC_UUID" ]; then
             echo "── app Mac profile (none pasted, fetching) ──"
-            if ! fetch_profile "$BUNDLE_ID" macos "App_macos.mobileprovision"; then
+            # "catalyst", not "macos": Apple issues Mac Catalyst App Store
+            # profiles as their own type and exportArchive rejects a plain Mac
+            # App Store profile with 'is not a "Mac Catalyst App Store" profile'.
+            if ! fetch_profile "$BUNDLE_ID" catalyst "App_macos.mobileprovision"; then
               echo "::error::could not obtain the app's Mac App Store profile - see the fastlane error above"; exit 1
             fi
             install_profile "$RUNNER_TEMP/App_macos.mobileprovision" macos
@@ -1126,9 +1129,12 @@ jobs:
               # existing valid profile, mint one only when there is none or it
               # has expired. First release creates, every release after reuses,
               # and nothing accumulates against Apple's per-account limit.
+              # Same reason as the app's Mac profile above.
+              SIGH_PLAT="$PLAT"
+              [ "$PLAT" = "macos" ] && SIGH_PLAT="catalyst"
               if ! fastlane run get_provisioning_profile \
                     api_key_path:"$API_KEY_PATH" \
-                    app_identifier:"$EXT_ID" platform:"$PLAT" \
+                    app_identifier:"$EXT_ID" platform:"$SIGH_PLAT" \
                     team_id:"${{ steps.apple.outputs.team_id }}" \
                     skip_install:true \
                     output_path:"$RUNNER_TEMP" filename:"$EXT_BASENAME" \
