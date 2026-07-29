@@ -888,7 +888,7 @@ jobs:
                 <true/>
                 <key>com.apple.security.network.client</key>
                 <true/>
-                <key>com.apple.security.files.user-selected.read-only</key>
+                <key>com.apple.security.files.user-selected.read-write</key>
                 <true/>
               </dict>
               </plist>
@@ -896,7 +896,21 @@ jobs:
               else
                 /usr/libexec/PlistBuddy -c "Add :com.apple.security.app-sandbox bool true" "App/App.entitlements" 2>/dev/null || /usr/libexec/PlistBuddy -c "Set :com.apple.security.app-sandbox true" "App/App.entitlements"
                 /usr/libexec/PlistBuddy -c "Add :com.apple.security.network.client bool true" "App/App.entitlements" 2>/dev/null || /usr/libexec/PlistBuddy -c "Set :com.apple.security.network.client true" "App/App.entitlements"
-                /usr/libexec/PlistBuddy -c "Add :com.apple.security.files.user-selected.read-only bool true" "App/App.entitlements" 2>/dev/null || true
+                # read-WRITE, not read-only. MEASURED 2026-07-29 on a minimal Mac
+                # Catalyst app, three signed variants: with only
+                # files.user-selected.read-only, AppKit REFUSES to open the panel at
+                # all -- "your app has the User Selected File Read entitlement but it
+                # needs User Selected File Read/Write to display save panels" -- the
+                # UIDocumentPickerViewController(forExporting:asCopy:true) delegate is
+                # then NEVER called, so the app hangs on Save with nothing in any log
+                # the user or we can see. The same app with read-write wrote the file
+                # to disk; so did the unsandboxed control. asCopy:true does NOT make
+                # this a read-only operation -- the system still gates the panel on the
+                # write entitlement. Every app that saves on Mac through
+                # rushPresentCatalystSaveDialog depends on this line.
+                # Drop a stale read-only key first: a leftover one is what AppKit sees.
+                /usr/libexec/PlistBuddy -c "Delete :com.apple.security.files.user-selected.read-only" "App/App.entitlements" 2>/dev/null || true
+                /usr/libexec/PlistBuddy -c "Add :com.apple.security.files.user-selected.read-write bool true" "App/App.entitlements" 2>/dev/null || /usr/libexec/PlistBuddy -c "Set :com.apple.security.files.user-selected.read-write true" "App/App.entitlements"
               fi
               
               cat <<EOF > link_entitlements.rb
