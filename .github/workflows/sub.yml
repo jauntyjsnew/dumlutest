@@ -15,10 +15,10 @@ on:
         default: 'main'
 
       version:
-        description: 'Version (e.g., 1.0.0)'
+        description: 'Version — leave EMPTY to take it from App Store Connect automatically'
         required: false
         type: string
-        default: '1.0.0'
+        default: ''
       
       target_platform:
         description: 'Target'
@@ -138,6 +138,26 @@ jobs:
           brew install xcodegen
           cd app && xcodegen generate
 
+      # Reads the next version straight from App Store Connect so the run never has to
+      # ask. Highest versionString across iOS + macOS wins; still open -> reuse it,
+      # already live -> +1. Filling the "version" input overrides all of this.
+      - name: Auto Version Script
+        uses: actions/checkout@v4
+        with:
+          path: .wf
+          token: ${{ secrets.GH_PAT }}
+
+      - name: Auto Version
+        id: autover
+        env:
+          ASC_KEY_ID: ${{ steps.apple.outputs.api_key_id }}
+          ASC_ISSUER_ID: ${{ steps.apple.outputs.api_issuer_id }}
+          ASC_KEY_B64: ${{ steps.apple.outputs.api_key_base64 }}
+          BUNDLE_ID: ${{ env.BUNDLE_ID }}
+          MANUAL_VERSION: ${{ inputs.version }}
+          BUILD_MODE: ${{ inputs.build_mode }}
+        run: node "$GITHUB_WORKSPACE/.wf/.github/scripts/autover.cjs"
+
       - name: Build number
         id: ver
         run: |
@@ -148,8 +168,8 @@ jobs:
           # real build number (and marketing version) straight into the plist before archiving.
           for PL in app/App/Info.plist app/Widgets/Info.plist; do
             /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $BUILD" "$PL" || /usr/libexec/PlistBuddy -c "Add :CFBundleVersion string $BUILD" "$PL"
-            /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString ${{ inputs.version }}" "$PL" || /usr/libexec/PlistBuddy -c "Add :CFBundleShortVersionString string ${{ inputs.version }}" "$PL"
-            echo "$PL → CFBundleVersion=$BUILD CFBundleShortVersionString=${{ inputs.version }}"
+            /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString ${{ steps.autover.outputs.version }}" "$PL" || /usr/libexec/PlistBuddy -c "Add :CFBundleShortVersionString string ${{ steps.autover.outputs.version }}" "$PL"
+            echo "$PL → CFBundleVersion=$BUILD CFBundleShortVersionString=${{ steps.autover.outputs.version }}"
           done
 
       # ---------- BUILD ONLY (no signing) ----------
@@ -162,7 +182,7 @@ jobs:
           xcodebuild -project SubTracker.xcodeproj -scheme "$SCHEME" -configuration Release \
             -sdk iphonesimulator -destination 'generic/platform=iOS Simulator' \
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO \
-            MARKETING_VERSION=${{ inputs.version }} CURRENT_PROJECT_VERSION=${{ steps.ver.outputs.build }} \
+            MARKETING_VERSION=${{ steps.autover.outputs.version }} CURRENT_PROJECT_VERSION=${{ steps.ver.outputs.build }} \
             build 2>&1 | tee build-ios.log
           echo "Build-only completed."
 
@@ -249,7 +269,7 @@ jobs:
           # team + distribution profile + an ExportOptions.plist with signingStyle manual.
           # No spaces in xcargs (CODE_SIGN_IDENTITY="Apple Distribution" lives in project.yml
           # Release config) so the build settings pass through cleanly.
-          XCARGS="DEVELOPMENT_TEAM=$TEAM_ID CODE_SIGN_STYLE=Manual CODE_SIGNING_REQUIRED=YES CODE_SIGNING_ALLOWED=YES CURRENT_PROJECT_VERSION=${{ steps.ver.outputs.build }} MARKETING_VERSION=${{ inputs.version }}"
+          XCARGS="DEVELOPMENT_TEAM=$TEAM_ID CODE_SIGN_STYLE=Manual CODE_SIGNING_REQUIRED=YES CODE_SIGNING_ALLOWED=YES CURRENT_PROJECT_VERSION=${{ steps.ver.outputs.build }} MARKETING_VERSION=${{ steps.autover.outputs.version }}"
 
           # Write an ExportOptions.plist with echo lines (heredocs are fragile inside YAML).
           # provisioningProfiles must map BOTH the app and the embedded widget extension,

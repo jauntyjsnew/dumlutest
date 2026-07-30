@@ -43,10 +43,10 @@ on:
         default: 'main'
 
       version:
-        description: 'Version (e.g., 1.0.0)'
+        description: 'Version — leave EMPTY to take it from App Store Connect automatically'
         required: false
         type: string
-        default: '1.0.0'
+        default: ''
       
       target_platform:
         description: 'Target'
@@ -846,12 +846,32 @@ jobs:
           cp $MAC_PP_PATH ~/Library/MobileDevice/Provisioning\ Profiles/$MAC_UUID.provisionprofile
           echo "uuid=$MAC_UUID" >> $GITHUB_OUTPUT
       
+      # Reads the next version straight from App Store Connect so the run never has to
+      # ask. Highest versionString across iOS + macOS wins; still open -> reuse it,
+      # already live -> +1. Filling the "version" input overrides all of this.
+      - name: Auto Version Script
+        uses: actions/checkout@v4
+        with:
+          path: .wf
+          token: ${{ secrets.GH_PAT }}
+
+      - name: Auto Version
+        id: autover
+        env:
+          ASC_KEY_ID: ${{ steps.apple.outputs.api_key_id }}
+          ASC_ISSUER_ID: ${{ steps.apple.outputs.api_issuer_id }}
+          ASC_KEY_B64: ${{ steps.apple.outputs.api_key_base64 }}
+          BUNDLE_ID: ${{ steps.capacitor.outputs.bundle_id }}
+          MANUAL_VERSION: ${{ inputs.version }}
+          BUILD_MODE: ${{ inputs.build_mode }}
+        run: node "$GITHUB_WORKSPACE/.wf/.github/scripts/autover.cjs"
+
       - name: Version
         working-directory: app/ios/App
         run: |
           BUILD_NUM=$(date -u +"%Y%m%d%H%M")
           /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $BUILD_NUM" App/Info.plist
-          /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString ${{ inputs.version }}" App/Info.plist
+          /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString ${{ steps.autover.outputs.version }}" App/Info.plist
       
       - name: Display Name
         working-directory: app
