@@ -130,12 +130,16 @@ jobs:
         env:
           WIDGET_PROFILE_B64: ${{ secrets.SUBTRACKER_WIDGET_PROFILE_B64 }}
         run: |
+          # No longer a hard gate: if the secret is absent, "Install provisioning
+          # profiles" now auto-fetches the widget's own App Store profile from
+          # Apple (WIDGET_BUNDLE_ID) the same way it does for the main app. That
+          # step still fails the job if the fetch itself fails, so nothing is
+          # silently skipped — this is now just an early heads-up.
           if [ -z "$WIDGET_PROFILE_B64" ]; then
-            echo "::error::Missing secret SUBTRACKER_WIDGET_PROFILE_B64 (widget provisioning profile)"
-            echo "Missing secret SUBTRACKER_WIDGET_PROFILE_B64 (widget provisioning profile)"
-            exit 1
+            echo "No SUBTRACKER_WIDGET_PROFILE_B64 secret set - the widget's App Store profile will be fetched automatically from Apple later, in the Install provisioning profiles step."
+          else
+            echo "Widget provisioning profile secret present."
           fi
-          echo "Widget provisioning profile secret present."
 
       - name: Clone app repo
         uses: actions/checkout@v4
@@ -240,14 +244,71 @@ jobs:
             echo "WIDGET_PROFILE_UUID=$WIDGET_UUID" >> "$GITHUB_ENV"
             echo "Installed widget profile UUID=$WIDGET_UUID"
           fi
+          # ─── Auto Profile: fetch from Apple when nothing was pasted/secreted ──
+          # Ported from r.yml's proven "Auto Profile" step: when a profile is not
+          # supplied, idempotently downloads the App Store profile from Apple
+          # with the same App Store Connect API key used for upload. This app
+          # has NO Mac Catalyst leg, but it DOES have a widget extension, which
+          # is a separate App ID (WIDGET_BUNDLE_ID) from the main app
+          # (BUNDLE_ID) — each gets its own profile fetched under its own
+          # bundle id; the widget NEVER reuses the main app's profile.
+          if [ -z "$IOS_UUID" ] || [ -z "$WIDGET_UUID" ]; then
+            gem install fastlane --no-document
+            API_KEY_CONTENT=$(echo "${{ steps.apple.outputs.api_key_base64 }}" | base64 --decode)
+            API_KEY_PATH="$RUNNER_TEMP/auto_api_key.json"
+            jq -n --arg key_id "${{ steps.apple.outputs.api_key_id }}" \
+                  --arg issuer_id "${{ steps.apple.outputs.api_issuer_id }}" \
+                  --arg key "$API_KEY_CONTENT" \
+                  '{key_id: $key_id, issuer_id: $issuer_id, key: $key, in_house: false}' > "$API_KEY_PATH"
+            export SPACESHIP_SKIP_2FA_UPGRADE=1
+
+            INSTALLED_UUID=""
+            grab() {
+              # $1 app identifier (bundle id), $2 output basename.
+              # The uuid comes back in INSTALLED_UUID rather than on stdout: a
+              # ::add-mask:: directive only registers on stdout, so printing the
+              # value would capture the directive along with it.
+              local APPID="$1" BASE="$2"
+              if ! fastlane run get_provisioning_profile \
+                    api_key_path:"$API_KEY_PATH" \
+                    app_identifier:"$APPID" platform:"ios" \
+                    team_id:"${{ steps.apple.outputs.team_id }}" \
+                    skip_install:true output_path:"$RUNNER_TEMP" filename:"$BASE" 2>&1 | tail -6; then
+                echo "::error::could not obtain the App Store profile for $APPID - read the fastlane error above. Only if it mentions FORBIDDEN or authentication does the App Store Connect API key need a wider role."
+                exit 1
+              fi
+              local F="$RUNNER_TEMP/$BASE"
+              [ -f "$F" ] || F=$(find "$RUNNER_TEMP" . -name "$BASE" -type f 2>/dev/null | head -1)
+              if [ ! -f "$F" ]; then echo "::error::profile for $APPID was not written"; exit 1; fi
+              INSTALLED_UUID=$(/usr/libexec/PlistBuddy -c "Print UUID" /dev/stdin <<< $(security cms -D -i "$F"))
+              echo "::add-mask::$INSTALLED_UUID"
+              cp "$F" ~/Library/MobileDevice/Provisioning\ Profiles/$INSTALLED_UUID.mobileprovision
+            }
+
+            if [ -z "$IOS_UUID" ]; then
+              echo "no iOS profile pasted - fetching for $BUNDLE_ID"
+              grab "$BUNDLE_ID" "auto_ios.mobileprovision"
+              IOS_UUID="$INSTALLED_UUID"
+              echo "IOS_PROFILE_UUID=$IOS_UUID" >> "$GITHUB_ENV"
+              echo "  iOS profile ready"
+            fi
+            if [ -z "$WIDGET_UUID" ]; then
+              echo "no widget profile secret set - fetching for $WIDGET_BUNDLE_ID (separate App ID; never the main app's profile)"
+              grab "$WIDGET_BUNDLE_ID" "auto_widget.mobileprovision"
+              WIDGET_UUID="$INSTALLED_UUID"
+              echo "WIDGET_PROFILE_UUID=$WIDGET_UUID" >> "$GITHUB_ENV"
+              echo "  widget profile ready"
+            fi
+          fi
+
           # Manual App Store signing needs a distribution profile. Fail early + clearly.
           # (check the LOCAL var, not the env one — env only reaches later steps.)
           if [ "${{ inputs.target_platform }}" != "macos_only" ] && [ -z "$IOS_UUID" ]; then
-            echo "::error::publish_to_appstore needs an iOS App Store provisioning profile (provisioning_profile_base64). Pass a *Distribution / App Store* profile for $BUNDLE_ID."
+            echo "::error::publish_to_appstore needs an iOS App Store provisioning profile (provisioning_profile_base64), and none could be fetched automatically. Pass a *Distribution / App Store* profile for $BUNDLE_ID."
             exit 1
           fi
           if [ "${{ inputs.target_platform }}" != "macos_only" ] && [ -z "$WIDGET_UUID" ]; then
-            echo "::error::Missing secret SUBTRACKER_WIDGET_PROFILE_B64 (widget provisioning profile)"
+            echo "::error::Missing widget provisioning profile for $WIDGET_BUNDLE_ID (SUBTRACKER_WIDGET_PROFILE_B64 not set, and the automatic fetch also failed)."
             exit 1
           fi
 

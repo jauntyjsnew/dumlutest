@@ -741,7 +741,161 @@ jobs:
           mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
           cp $SE_PP_PATH ~/Library/MobileDevice/Provisioning\ Profiles/$SE_UUID.mobileprovision
           echo "uuid=$SE_UUID" >> $GITHUB_OUTPUT
-      
+
+      # ─── Profiles, when none were pasted / no secret was set ──────────
+      # provisioning_profile_base64 / mac_provisioning_profile_base64 /
+      # WINMAIL_SHAREEXT_PROFILE stay exactly as they were: set one and it is
+      # used, unchanged. This step only runs for whichever of the three was
+      # left empty, and downloads the existing App Store profile with the
+      # App Store Connect API key that is already here for the upload.
+      #
+      # ShareExt has its OWN bundle id ("<app bundle id>.ShareExt", same
+      # convention the Build App step already uses below) and gets its OWN
+      # profile — never the app's. ShareExt is excluded entirely on
+      # macos_only (see "Mac Exclude ShareExt"), so nothing is fetched for
+      # it in that mode.
+      #
+      # Matching is by APP ID, never by name: app_identifier is the bundle id
+      # read out of the project being built, so two apps whose names both
+      # start "win" cannot collide.
+      #
+      # Idempotent — an existing valid profile is downloaded, not
+      # regenerated — so nothing accumulates against Apple's per-account
+      # profile limit.
+      - name: Auto Profile
+        id: auto_profile
+        if: inputs.build_mode == 'publish_to_appstore'
+        run: |
+          set -uo pipefail
+          IOS_UUID="${{ steps.provision.outputs.uuid }}"
+          MAC_UUID="${{ steps.mac_provision.outputs.uuid }}"
+          SE_UUID="${{ steps.shareext_provision.outputs.uuid }}"
+          NEED_MAC=false
+          if [ "${{ inputs.target_platform }}" = "all_devices" ] || [ "${{ inputs.target_platform }}" = "macos_only" ]; then
+            NEED_MAC=true
+          fi
+          NEED_SHAREEXT=true
+          if [ "${{ inputs.target_platform }}" = "macos_only" ]; then
+            NEED_SHAREEXT=false
+          fi
+          if [ -n "$IOS_UUID" ] && { [ "$NEED_MAC" != "true" ] || [ -n "$MAC_UUID" ]; } && { [ "$NEED_SHAREEXT" != "true" ] || [ -n "$SE_UUID" ]; }; then
+            echo "profiles supplied in the dispatch inputs / secret - nothing to fetch"
+            echo "ios_uuid=" >> $GITHUB_OUTPUT
+            echo "mac_uuid=" >> $GITHUB_OUTPUT
+            echo "shareext_ios_uuid=" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          BUNDLE_ID="${{ steps.capacitor.outputs.bundle_id }}"
+          if [ -z "$BUNDLE_ID" ]; then
+            echo "::error::no bundle id - cannot fetch a profile"; exit 1
+          fi
+          API_KEY_CONTENT=$(echo "${{ steps.apple.outputs.api_key_base64 }}" | base64 --decode)
+          API_KEY_PATH="$RUNNER_TEMP/auto_api_key.json"
+          jq -n --arg key_id "${{ steps.apple.outputs.api_key_id }}" \
+                --arg issuer_id "${{ steps.apple.outputs.api_issuer_id }}" \
+                --arg key "$API_KEY_CONTENT" \
+                '{key_id: $key_id, issuer_id: $issuer_id, key: $key, in_house: false}' > "$API_KEY_PATH"
+          echo "$API_KEY_CONTENT" > "$RUNNER_TEMP/auto_key.p8"
+          export SPACESHIP_SKIP_2FA_UPGRADE=1
+          mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
+
+          INSTALLED_UUID=""
+          grab() {
+            # $1 sigh platform, $2 output basename, $3 install extension, $4 app identifier.
+            # The uuid comes back in INSTALLED_UUID rather than on stdout: a
+            # ::add-mask:: directive only registers on stdout, so printing the
+            # value would capture the directive along with it.
+            local PLAT="$1" BASE="$2" EXT="$3" IDENT="$4"
+            if ! fastlane run get_provisioning_profile \
+                  api_key_path:"$API_KEY_PATH" \
+                  app_identifier:"$IDENT" platform:"$PLAT" \
+                  team_id:"${{ steps.apple.outputs.team_id }}" \
+                  skip_install:true output_path:"$RUNNER_TEMP" filename:"$BASE" 2>&1 | tail -6; then
+              echo "::error::could not obtain the $PLAT App Store profile for $IDENT - read the fastlane error above. Only if it mentions FORBIDDEN or authentication does the App Store Connect API key need a wider role."
+              exit 1
+            fi
+            local F="$RUNNER_TEMP/$BASE"
+            [ -f "$F" ] || F=$(find "$RUNNER_TEMP" . -name "$BASE" -type f 2>/dev/null | head -1)
+            if [ ! -f "$F" ]; then echo "::error::$PLAT profile was not written"; exit 1; fi
+            INSTALLED_UUID=$(/usr/libexec/PlistBuddy -c "Print UUID" /dev/stdin <<< $(security cms -D -i "$F"))
+            echo "::add-mask::$INSTALLED_UUID"
+            cp "$F" ~/Library/MobileDevice/Provisioning\ Profiles/$INSTALLED_UUID.$EXT
+          }
+
+          OUT_IOS=""
+          OUT_MAC=""
+          OUT_SE=""
+          if [ -z "$IOS_UUID" ]; then
+            echo "no iOS profile pasted - fetching"
+            grab ios "auto_ios.mobileprovision" mobileprovision "$BUNDLE_ID"
+            OUT_IOS="$INSTALLED_UUID"
+            echo "  iOS profile ready"
+          fi
+          if [ "$NEED_MAC" = "true" ] && [ -z "$MAC_UUID" ]; then
+            # "catalyst", not "macos": this pipeline's Mac build is Mac Catalyst,
+            # and exportArchive rejects a plain Mac App Store profile for it.
+            echo "no Mac profile pasted - fetching"
+            grab catalyst "auto_mac.mobileprovision" provisionprofile "$BUNDLE_ID"
+            OUT_MAC="$INSTALLED_UUID"
+            echo "  Mac profile ready"
+          fi
+          if [ "$NEED_SHAREEXT" = "true" ] && [ -z "$SE_UUID" ]; then
+            echo "no ShareExt profile secret set - fetching"
+            SE_BUNDLE_ID="${BUNDLE_ID}.ShareExt"
+            # Create the App ID first if it does not exist yet. `produce` has no
+            # api_key_path option at all — it authenticates with a username and
+            # password, which this pipeline deliberately does not have.
+            # Spaceship's Connect API client does accept the key, so the bundle
+            # id is created with that, exactly like a first release of an app
+            # with extensions creates its own identifiers.
+            if ! SE_ID="$SE_BUNDLE_ID" \
+                 API_KEY_ID="${{ steps.apple.outputs.api_key_id }}" \
+                 API_ISSUER="${{ steps.apple.outputs.api_issuer_id }}" \
+                 API_P8="$RUNNER_TEMP/auto_key.p8" \
+                 ruby -e '
+                   require "spaceship"
+                   token = Spaceship::ConnectAPI::Token.create(
+                     key_id: ENV["API_KEY_ID"],
+                     issuer_id: ENV["API_ISSUER"],
+                     filepath: ENV["API_P8"],
+                   )
+                   Spaceship::ConnectAPI.token = token
+                   id = ENV["SE_ID"]
+                   found = (Spaceship::ConnectAPI::BundleId.find(id) rescue nil)
+                   found ||= (Spaceship::ConnectAPI::BundleId.all.find { |b| b.identifier == id } rescue nil)
+                   if found
+                     puts "identifier exists: #{id}"
+                   else
+                     # The constant moved between fastlane versions - Platform
+                     # in some, BundleIdPlatform in others - and the API itself
+                     # only wants the string.
+                     plat = begin
+                       Spaceship::ConnectAPI::BundleIdPlatform::UNIVERSAL
+                     rescue NameError
+                       begin
+                         Spaceship::ConnectAPI::Platform::UNIVERSAL
+                       rescue NameError
+                         "UNIVERSAL"
+                       end
+                     end
+                     Spaceship::ConnectAPI::BundleId.create(
+                       name: "ShareExt", identifier: id, platform: plat,
+                     )
+                     puts "identifier created: #{id}"
+                   end
+                 '; then
+              echo "::error::could not create the App ID $SE_BUNDLE_ID - see the ruby error immediately above. If it mentions FORBIDDEN or authentication, the App Store Connect API key needs the Admin or App Manager role; anything else is a bug in this step, not a permissions problem."
+              exit 1
+            fi
+            grab ios "auto_shareext.mobileprovision" mobileprovision "$SE_BUNDLE_ID"
+            OUT_SE="$INSTALLED_UUID"
+            echo "  ShareExt profile ready"
+          fi
+          echo "ios_uuid=$OUT_IOS" >> $GITHUB_OUTPUT
+          echo "mac_uuid=$OUT_MAC" >> $GITHUB_OUTPUT
+          echo "shareext_ios_uuid=$OUT_SE" >> $GITHUB_OUTPUT
+
       - name: Version
         working-directory: app/ios/App
         run: |
@@ -857,8 +1011,8 @@ jobs:
         if: inputs.build_mode == 'publish_to_appstore'
         working-directory: app/ios/App
         env:
-          PROFILE_UUID: ${{ steps.provision.outputs.uuid }}
-          SE_PROFILE_UUID: ${{ steps.shareext_provision.outputs.uuid }}
+          PROFILE_UUID: ${{ steps.provision.outputs.uuid || steps.auto_profile.outputs.ios_uuid }}
+          SE_PROFILE_UUID: ${{ steps.shareext_provision.outputs.uuid || steps.auto_profile.outputs.shareext_ios_uuid }}
         run: |
           echo "require 'xcodeproj'" > disable_signing.rb
           echo "project = Xcodeproj::Project.open('App.xcodeproj')" >> disable_signing.rb
@@ -1004,8 +1158,8 @@ jobs:
             export FASTLANE_XCODEBUILD_SETTINGS_RETRIES=6
             
             if [ "${{ inputs.target_platform }}" != "macos_only" ]; then
-              SE_PROFILE_UUID="${{ steps.shareext_provision.outputs.uuid }}"
-              IOS_PROFILE_UUID="${{ steps.provision.outputs.uuid }}"
+              SE_PROFILE_UUID="${{ steps.shareext_provision.outputs.uuid || steps.auto_profile.outputs.shareext_ios_uuid }}"
+              IOS_PROFILE_UUID="${{ steps.provision.outputs.uuid || steps.auto_profile.outputs.ios_uuid }}"
               IOS_BUNDLE_ID="${{ steps.capacitor.outputs.bundle_id }}"
               if [ -n "$SE_PROFILE_UUID" ] && [ -n "$IOS_PROFILE_UUID" ]; then
                 echo '<?xml version="1.0" encoding="UTF-8"?>' > iOSExportOptions.plist
@@ -1036,7 +1190,7 @@ jobs:
             if [ "${{ inputs.target_platform }}" == "macos_only" ] || [ "${{ inputs.target_platform }}" == "all_devices" ]; then
               prepare_geolocation_for_catalyst
 
-              MAC_PROFILE_UUID="${{ steps.mac_provision.outputs.uuid }}"
+              MAC_PROFILE_UUID="${{ steps.mac_provision.outputs.uuid || steps.auto_profile.outputs.mac_uuid }}"
               if [ -z "$MAC_PROFILE_UUID" ]; then exit 1; fi
               
               BUNDLE_ID="${{ steps.capacitor.outputs.bundle_id }}"

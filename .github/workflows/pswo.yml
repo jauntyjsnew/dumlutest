@@ -227,10 +227,70 @@ jobs:
             echo "MAC_PROFILE_UUID=$MAC_UUID" >> "$GITHUB_ENV"
             echo "Installed macOS profile UUID=$MAC_UUID"
           fi
+          # ─── Auto Profile: fetch from Apple when nothing was pasted ──────
+          # Ported from r.yml's proven "Auto Profile" step: when a profile is
+          # not pasted, idempotently downloads the app's existing App Store
+          # profile from Apple with the same App Store Connect API key used
+          # for upload, matched by bundle id (never by name).
+          NEED_MAC=false
+          if [ "${{ inputs.target_platform }}" == "all_devices" ] || [ "${{ inputs.target_platform }}" == "macos_only" ]; then
+            NEED_MAC=true
+          fi
+          if [ -z "$IOS_UUID" ] || { [ "$NEED_MAC" == "true" ] && [ -z "$MAC_UUID" ]; }; then
+            gem install fastlane --no-document
+            API_KEY_CONTENT=$(echo "${{ steps.apple.outputs.api_key_base64 }}" | base64 --decode)
+            API_KEY_PATH="$RUNNER_TEMP/auto_api_key.json"
+            jq -n --arg key_id "${{ steps.apple.outputs.api_key_id }}" \
+                  --arg issuer_id "${{ steps.apple.outputs.api_issuer_id }}" \
+                  --arg key "$API_KEY_CONTENT" \
+                  '{key_id: $key_id, issuer_id: $issuer_id, key: $key, in_house: false}' > "$API_KEY_PATH"
+            export SPACESHIP_SKIP_2FA_UPGRADE=1
+
+            INSTALLED_UUID=""
+            grab() {
+              # $1 sigh platform, $2 output basename, $3 install extension.
+              # The uuid comes back in INSTALLED_UUID rather than on stdout: a
+              # ::add-mask:: directive only registers on stdout, so printing the
+              # value would capture the directive along with it.
+              local PLAT="$1" BASE="$2" EXT="$3"
+              if ! fastlane run get_provisioning_profile \
+                    api_key_path:"$API_KEY_PATH" \
+                    app_identifier:"$BUNDLE_ID" platform:"$PLAT" \
+                    team_id:"${{ steps.apple.outputs.team_id }}" \
+                    skip_install:true output_path:"$RUNNER_TEMP" filename:"$BASE" 2>&1 | tail -6; then
+                echo "::error::could not obtain the $PLAT App Store profile for this app - read the fastlane error above. Only if it mentions FORBIDDEN or authentication does the App Store Connect API key need a wider role."
+                exit 1
+              fi
+              local F="$RUNNER_TEMP/$BASE"
+              [ -f "$F" ] || F=$(find "$RUNNER_TEMP" . -name "$BASE" -type f 2>/dev/null | head -1)
+              if [ ! -f "$F" ]; then echo "::error::$PLAT profile was not written"; exit 1; fi
+              INSTALLED_UUID=$(/usr/libexec/PlistBuddy -c "Print UUID" /dev/stdin <<< $(security cms -D -i "$F"))
+              echo "::add-mask::$INSTALLED_UUID"
+              cp "$F" ~/Library/MobileDevice/Provisioning\ Profiles/$INSTALLED_UUID.$EXT
+            }
+
+            if [ -z "$IOS_UUID" ]; then
+              echo "no iOS profile pasted - fetching"
+              grab ios "auto_ios.mobileprovision" mobileprovision
+              IOS_UUID="$INSTALLED_UUID"
+              echo "IOS_PROFILE_UUID=$IOS_UUID" >> "$GITHUB_ENV"
+              echo "  iOS profile ready"
+            fi
+            if [ "$NEED_MAC" == "true" ] && [ -z "$MAC_UUID" ]; then
+              # "catalyst", not "macos": this pipeline's Mac build is Mac Catalyst,
+              # and exportArchive rejects a plain Mac App Store profile for it.
+              echo "no Mac profile pasted - fetching"
+              grab catalyst "auto_mac.mobileprovision" provisionprofile
+              MAC_UUID="$INSTALLED_UUID"
+              echo "MAC_PROFILE_UUID=$MAC_UUID" >> "$GITHUB_ENV"
+              echo "  Mac profile ready"
+            fi
+          fi
+
           # Manual App Store signing needs a distribution profile. Fail early + clearly.
           # (check the LOCAL var, not the env one — env only reaches later steps.)
           if [ "${{ inputs.target_platform }}" != "macos_only" ] && [ -z "$IOS_UUID" ]; then
-            echo "::error::publish_to_appstore needs an iOS App Store provisioning profile (provisioning_profile_base64). Pass a *Distribution / App Store* profile for $BUNDLE_ID."
+            echo "::error::publish_to_appstore needs an iOS App Store provisioning profile (provisioning_profile_base64), and none could be fetched automatically. Pass a *Distribution / App Store* profile for $BUNDLE_ID."
             exit 1
           fi
 
