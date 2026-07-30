@@ -78,6 +78,20 @@ jobs:
             echo "::add-mask::${{ inputs.mac_provisioning_profile_base64 }}"
           fi
 
+      # This app has a share extension, and the Mac leg cannot carry it: the
+      # "Mac Exclude ShareExt" step strips it, but it runs before Build App, so
+      # on all_devices it would strip the extension out of the iOS archive too.
+      # MacExportOptions.plist correspondingly maps only the app's own bundle id.
+      # Both are fine for the way this workflow is actually used - one dispatch
+      # for iOS, a second for macos_only - and all_devices has never been run
+      # here. Rather than leave that path to fail deep inside exportArchive with
+      # a missing-profile error, say so up front.
+      - name: Reject all_devices
+        if: inputs.target_platform == 'all_devices'
+        run: |
+          echo "::error::win.yml cannot build iOS and Mac in one run, because the ShareExt extension has to be stripped for the Mac leg and that would remove it from the iOS archive as well. Dispatch twice: once with iphone_and_ipad, once with macos_only."
+          exit 1
+
       - name: Parse
         id: apple
         env:
