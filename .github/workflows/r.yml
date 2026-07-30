@@ -63,11 +63,6 @@ on:
         type: string
         default: 'public.app-category.utilities'
 
-      allow_stripped_plugins:
-        description: 'Ship even if src/ calls a plugin Catalyst cannot link (dead feature)'
-        required: false
-        type: boolean
-        default: false
 
 jobs:
   build:
@@ -378,7 +373,7 @@ jobs:
           sed -i.bak 's/CommonFunctionality\.presentCodeRedemptionSheet()/#if !targetEnvironment(macCatalyst)\n            CommonFunctionality.presentCodeRedemptionSheet()\n            #else\n            \/\/ Not available on Mac Catalyst\n            call.reject("Not available on Mac Catalyst")\n            return\n            #endif/g' "$PLUGIN_FILE"
 
       - name: Geolocation Catalyst Patch
-        if: (inputs.target_platform == 'all_devices' || inputs.target_platform == 'macos_only') && inputs.repository_url == 'jauntyjsnew/GPXview'
+        if: inputs.target_platform == 'all_devices' || inputs.target_platform == 'macos_only'
         working-directory: app
         run: |
           GEO_DIR="node_modules/@capacitor/geolocation/ios/Sources/GeolocationPlugin"
@@ -653,12 +648,8 @@ jobs:
           check "@capacitor/filesystem" "CapacitorFilesystem"
           check "@capacitor-community/admob" "CapacitorCommunityAdmob"
           if [ "$FAIL" = "1" ]; then
-            if [ "${{ inputs.allow_stripped_plugins }}" = "true" ]; then
-              echo "::warning::allow_stripped_plugins is set — shipping with the feature above dead on every platform."
-            else
-              echo "Fix options: (a) let the v6 pin work, (b) write through your own native plugin method (pattern: mht-viewer-converter MHTEnginePlugin.writeCacheFile + src/lib/cache-file.ts), (c) build this app without Mac, or (d) re-run with allow_stripped_plugins to ship the feature dead."
+              echo "Fix options: (a) let the v6 pin work, (b) write through your own native plugin method (pattern: mht-viewer-converter MHTEnginePlugin.writeCacheFile + src/lib/cache-file.ts), (c) build this app without Mac."
               exit 1
-            fi
           fi
       
       - name: Pods Target
@@ -1001,7 +992,6 @@ jobs:
           fi
 
           prepare_geolocation_for_catalyst() {
-            if [ "${{ inputs.repository_url }}" != "jauntyjsnew/GPXview" ]; then return 0; fi
             GEO_PODSPEC="../../node_modules/@capacitor/geolocation/CapacitorGeolocation.podspec"
             if [ -f "$GEO_PODSPEC" ] && grep -q "IONGeolocationLib" "$GEO_PODSPEC"; then
               sed -i.bak "/IONGeolocationLib/d" "$GEO_PODSPEC"
