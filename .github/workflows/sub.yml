@@ -105,6 +105,26 @@ jobs:
       # The widget extension (WIDGET_BUNDLE_ID) needs its own App Store provisioning
       # profile. Inputs must stay byte-identical to the template (the Chrome extension
       # auto-fills by key name), so the widget profile rides in as a repo SECRET instead.
+
+      # Reads the next version straight from App Store Connect so the run never has to
+      # ask. Highest versionString across iOS + macOS wins; still open -> reuse it,
+      # already live -> +1. Filling the "version" input overrides all of this.
+      - name: Auto Version Script
+        uses: actions/checkout@v4
+        with:
+          path: .wf
+          token: ${{ secrets.GH_PAT }}
+
+      - name: Auto Version
+        id: autover
+        env:
+          ASC_KEY_ID: ${{ steps.apple.outputs.api_key_id }}
+          ASC_ISSUER_ID: ${{ steps.apple.outputs.api_issuer_id }}
+          ASC_KEY_B64: ${{ steps.apple.outputs.api_key_base64 }}
+          BUNDLE_ID: ${{ env.BUNDLE_ID }}
+          MANUAL_VERSION: ${{ inputs.version }}
+          BUILD_MODE: ${{ inputs.build_mode }}
+        run: node "$GITHUB_WORKSPACE/.wf/.github/scripts/autover.cjs"
       - name: Require widget provisioning profile secret
         if: inputs.build_mode == 'publish_to_appstore' && inputs.target_platform != 'macos_only'
         env:
@@ -137,26 +157,6 @@ jobs:
         run: |
           brew install xcodegen
           cd app && xcodegen generate
-
-      # Reads the next version straight from App Store Connect so the run never has to
-      # ask. Highest versionString across iOS + macOS wins; still open -> reuse it,
-      # already live -> +1. Filling the "version" input overrides all of this.
-      - name: Auto Version Script
-        uses: actions/checkout@v4
-        with:
-          path: .wf
-          token: ${{ secrets.GH_PAT }}
-
-      - name: Auto Version
-        id: autover
-        env:
-          ASC_KEY_ID: ${{ steps.apple.outputs.api_key_id }}
-          ASC_ISSUER_ID: ${{ steps.apple.outputs.api_issuer_id }}
-          ASC_KEY_B64: ${{ steps.apple.outputs.api_key_base64 }}
-          BUNDLE_ID: ${{ env.BUNDLE_ID }}
-          MANUAL_VERSION: ${{ inputs.version }}
-          BUILD_MODE: ${{ inputs.build_mode }}
-        run: node "$GITHUB_WORKSPACE/.wf/.github/scripts/autover.cjs"
 
       - name: Build number
         id: ver

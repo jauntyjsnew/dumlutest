@@ -114,6 +114,13 @@ async function fetchVersions(bundleId, keyId, issuerId, privateKeyPem) {
 // --- main ---
 
 async function main() {
+  // Runs before actions/setup-node in some workflows, so it uses whatever Node the
+  // runner image ships. Say so plainly rather than dying on "fetch is not defined".
+  if (typeof fetch !== 'function') {
+    console.log('::error::Auto Version needs Node 18 or newer (global fetch); this runner has ' + process.version + '.');
+    process.exit(1);
+  }
+
   const bundleId = (process.env.BUNDLE_ID || '').trim();
   const manual = (process.env.MANUAL_VERSION || '').trim();
   const publish = (process.env.BUILD_MODE || '').trim() === 'publish_to_appstore';

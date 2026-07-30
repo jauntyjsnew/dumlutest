@@ -101,6 +101,26 @@ jobs:
             echo "api_key_base64=$API_B64"
           } >> "$GITHUB_OUTPUT"
 
+      # Reads the next version straight from App Store Connect so the run never has to
+      # ask. Highest versionString across iOS + macOS wins; still open -> reuse it,
+      # already live -> +1. Filling the "version" input overrides all of this.
+      - name: Auto Version Script
+        uses: actions/checkout@v4
+        with:
+          path: .wf
+          token: ${{ secrets.GH_PAT }}
+
+      - name: Auto Version
+        id: autover
+        env:
+          ASC_KEY_ID: ${{ steps.apple.outputs.api_key_id }}
+          ASC_ISSUER_ID: ${{ steps.apple.outputs.api_issuer_id }}
+          ASC_KEY_B64: ${{ steps.apple.outputs.api_key_base64 }}
+          BUNDLE_ID: ${{ env.BUNDLE_ID }}
+          MANUAL_VERSION: ${{ inputs.version }}
+          BUILD_MODE: ${{ inputs.build_mode }}
+        run: node "$GITHUB_WORKSPACE/.wf/.github/scripts/autover.cjs"
+
       - name: Clone app repo
         uses: actions/checkout@v4
         with:
@@ -128,26 +148,6 @@ jobs:
         run: |
           brew install xcodegen
           cd app && xcodegen generate
-
-      # Reads the next version straight from App Store Connect so the run never has to
-      # ask. Highest versionString across iOS + macOS wins; still open -> reuse it,
-      # already live -> +1. Filling the "version" input overrides all of this.
-      - name: Auto Version Script
-        uses: actions/checkout@v4
-        with:
-          path: .wf
-          token: ${{ secrets.GH_PAT }}
-
-      - name: Auto Version
-        id: autover
-        env:
-          ASC_KEY_ID: ${{ steps.apple.outputs.api_key_id }}
-          ASC_ISSUER_ID: ${{ steps.apple.outputs.api_issuer_id }}
-          ASC_KEY_B64: ${{ steps.apple.outputs.api_key_base64 }}
-          BUNDLE_ID: ${{ env.BUNDLE_ID }}
-          MANUAL_VERSION: ${{ inputs.version }}
-          BUILD_MODE: ${{ inputs.build_mode }}
-        run: node "$GITHUB_WORKSPACE/.wf/.github/scripts/autover.cjs"
 
       - name: Build number
         id: ver
