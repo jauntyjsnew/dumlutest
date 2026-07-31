@@ -23,12 +23,15 @@ jobs:
         with:
           repository: jauntyjsnew/mboxRUSH
           token: ${{ secrets.GH_PAT }}
+          # The PAT is needed only for checkout. Do not leave it in app/.git/config where later
+          # build scripts could read it.
+          persist-credentials: false
           fetch-depth: 0
           path: app
 
       - name: Prove runner architecture
         run: |
-          set -euxo pipefail
+          set -euo pipefail
           uname -a
           test "$(uname -m)" = "arm64"
           sysctl -n machdep.cpu.brand_string
@@ -41,10 +44,17 @@ jobs:
       - name: Generate 2.2 GiB Gmail Takeout fixture with 1.0.12 source
         working-directory: app
         run: |
-          set -euxo pipefail
+          set -euo pipefail
           git checkout 0d5b7b1
-          cargo run --release --manifest-path rust-engine/Cargo.toml \
-            -p mbox-engine-core --example diag -- \
+          # Keep compiler diagnostics private: warnings/errors can quote source lines in a public
+          # Actions log. The job exposes only the controlled synthetic-fixture result below.
+          if ! cargo build --quiet --release --manifest-path rust-engine/Cargo.toml \
+            -p mbox-engine-core --example diag \
+            >"$RUNNER_TEMP/generator-build.log" 2>&1; then
+            echo "Generator build failed; private compiler log was not published."
+            exit 1
+          fi
+          ./rust-engine/target/release/examples/diag \
             gen "$RUNNER_TEMP/google-takeout.mbox" "${{ inputs.size_gb }}"
           ls -lh "$RUNNER_TEMP/google-takeout.mbox"
 
@@ -53,33 +63,47 @@ jobs:
         continue-on-error: true
         working-directory: app/rust-engine
         run: |
-          set -euxo pipefail
-          cargo build --release -p mbox-engine-core --example diag \
-            --target aarch64-apple-ios-macabi
+          set -euo pipefail
+          if ! cargo build --quiet --release -p mbox-engine-core --example diag \
+            --target aarch64-apple-ios-macabi >"$RUNNER_TEMP/old-build.log" 2>&1; then
+            echo "1.0.12 build failed; private compiler log was not published."
+            exit 1
+          fi
           mkdir -p "$RUNNER_TEMP/old-tmp"
-          TMPDIR="$RUNNER_TEMP/old-tmp" /usr/bin/time -l \
+          if ! TMPDIR="$RUNNER_TEMP/old-tmp" RUST_BACKTRACE=0 /usr/bin/time -l \
             ./target/aarch64-apple-ios-macabi/release/examples/diag \
             load "$RUNNER_TEMP/google-takeout.mbox" \
-            | tee "$RUNNER_TEMP/old.log"
+            >"$RUNNER_TEMP/old.log" 2>"$RUNNER_TEMP/old-time.log"; then
+            echo "1.0.12 runtime check failed; private runtime output was not published."
+            exit 1
+          fi
           grep -q "LOAD OK: total_messages=36020" "$RUNNER_TEMP/old.log"
           grep -q "lazy read of one message OK" "$RUNNER_TEMP/old.log"
+          grep -E "LOAD OK:|lazy read of one message OK" "$RUNNER_TEMP/old.log"
 
       - name: Run 1.0.13 engine as arm64 Mac Catalyst
         id: current
         working-directory: app
         run: |
-          set -euxo pipefail
+          set -euo pipefail
           git checkout f21b84b
-          cargo build --release --manifest-path rust-engine/Cargo.toml \
+          if ! cargo build --quiet --release --manifest-path rust-engine/Cargo.toml \
             -p mbox-engine-core --example diag \
-            --target aarch64-apple-ios-macabi
+            --target aarch64-apple-ios-macabi >"$RUNNER_TEMP/current-build.log" 2>&1; then
+            echo "1.0.13 build failed; private compiler log was not published."
+            exit 1
+          fi
           mkdir -p "$RUNNER_TEMP/current-tmp"
-          TMPDIR="$RUNNER_TEMP/current-tmp" /usr/bin/time -l \
+          if ! TMPDIR="$RUNNER_TEMP/current-tmp" RUST_BACKTRACE=0 /usr/bin/time -l \
             ./rust-engine/target/aarch64-apple-ios-macabi/release/examples/diag \
             load "$RUNNER_TEMP/google-takeout.mbox" \
-            | tee "$RUNNER_TEMP/current.log"
+            >"$RUNNER_TEMP/current.log" 2>"$RUNNER_TEMP/current-time.log"; then
+            echo "1.0.13 runtime check failed; private runtime output was not published."
+            exit 1
+          fi
           grep -q "LOAD OK: total_messages=36020" "$RUNNER_TEMP/current.log"
           grep -q "lazy read of one message OK" "$RUNNER_TEMP/current.log"
+          grep -E "LOAD OK:|lazy read of one message OK" "$RUNNER_TEMP/current.log"
 
       - name: Publish diagnostic summary
         if: always()
@@ -91,12 +115,4 @@ jobs:
             echo "- Fixture: ${{ inputs.size_gb }} GiB Gmail Takeout-style MBOX"
             echo "- 1.0.12 check: ${{ steps.old.outcome }}"
             echo "- 1.0.13 check: ${{ steps.current.outcome }}"
-            echo
-            echo '```text'
-            echo "1.0.12:"
-            test -f "$RUNNER_TEMP/old.log" && tail -5 "$RUNNER_TEMP/old.log" || true
-            echo
-            echo "1.0.13:"
-            test -f "$RUNNER_TEMP/current.log" && tail -5 "$RUNNER_TEMP/current.log" || true
-            echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
