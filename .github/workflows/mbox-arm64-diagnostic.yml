@@ -1,0 +1,102 @@
+name: MBOX Apple Silicon runtime diagnostic
+
+on:
+  workflow_dispatch:
+    inputs:
+      size_gb:
+        description: "Synthetic Gmail Takeout size in GiB"
+        required: false
+        default: "2.2"
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  compare-engines:
+    runs-on: macos-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout private app repository
+        uses: actions/checkout@v4
+        with:
+          repository: jauntyjsnew/mboxRUSH
+          token: ${{ secrets.GH_PAT }}
+          fetch-depth: 0
+          path: app
+
+      - name: Prove runner architecture
+        run: |
+          set -euxo pipefail
+          uname -a
+          test "$(uname -m)" = "arm64"
+          sysctl -n machdep.cpu.brand_string
+          sw_vers
+          rustc -vV
+
+      - name: Install Apple Silicon Catalyst target
+        run: rustup target add aarch64-apple-ios-macabi
+
+      - name: Generate 2.2 GiB Gmail Takeout fixture with 1.0.12 source
+        working-directory: app
+        run: |
+          set -euxo pipefail
+          git checkout 0d5b7b1
+          cargo run --release --manifest-path rust-engine/Cargo.toml \
+            -p mbox-engine-core --example diag -- \
+            gen "$RUNNER_TEMP/google-takeout.mbox" "${{ inputs.size_gb }}"
+          ls -lh "$RUNNER_TEMP/google-takeout.mbox"
+
+      - name: Run 1.0.12 engine as arm64 Mac Catalyst
+        id: old
+        continue-on-error: true
+        working-directory: app/rust-engine
+        run: |
+          set -euxo pipefail
+          cargo build --release -p mbox-engine-core --example diag \
+            --target aarch64-apple-ios-macabi
+          mkdir -p "$RUNNER_TEMP/old-tmp"
+          TMPDIR="$RUNNER_TEMP/old-tmp" /usr/bin/time -l \
+            ./target/aarch64-apple-ios-macabi/release/examples/diag \
+            load "$RUNNER_TEMP/google-takeout.mbox" \
+            | tee "$RUNNER_TEMP/old.log"
+          grep -q "LOAD OK: total_messages=36020" "$RUNNER_TEMP/old.log"
+          grep -q "lazy read of one message OK" "$RUNNER_TEMP/old.log"
+
+      - name: Run 1.0.13 engine as arm64 Mac Catalyst
+        id: current
+        working-directory: app
+        run: |
+          set -euxo pipefail
+          git checkout f21b84b
+          cargo build --release --manifest-path rust-engine/Cargo.toml \
+            -p mbox-engine-core --example diag \
+            --target aarch64-apple-ios-macabi
+          mkdir -p "$RUNNER_TEMP/current-tmp"
+          TMPDIR="$RUNNER_TEMP/current-tmp" /usr/bin/time -l \
+            ./rust-engine/target/aarch64-apple-ios-macabi/release/examples/diag \
+            load "$RUNNER_TEMP/google-takeout.mbox" \
+            | tee "$RUNNER_TEMP/current.log"
+          grep -q "LOAD OK: total_messages=36020" "$RUNNER_TEMP/current.log"
+          grep -q "lazy read of one message OK" "$RUNNER_TEMP/current.log"
+
+      - name: Publish diagnostic summary
+        if: always()
+        run: |
+          {
+            echo "## MBOX Apple Silicon runtime comparison"
+            echo
+            echo "- Runner: $(uname -m) / $(sysctl -n machdep.cpu.brand_string)"
+            echo "- Fixture: ${{ inputs.size_gb }} GiB Gmail Takeout-style MBOX"
+            echo "- 1.0.12 check: ${{ steps.old.outcome }}"
+            echo "- 1.0.13 check: ${{ steps.current.outcome }}"
+            echo
+            echo '```text'
+            echo "1.0.12:"
+            test -f "$RUNNER_TEMP/old.log" && tail -5 "$RUNNER_TEMP/old.log" || true
+            echo
+            echo "1.0.13:"
+            test -f "$RUNNER_TEMP/current.log" && tail -5 "$RUNNER_TEMP/current.log" || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
