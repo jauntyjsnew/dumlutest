@@ -1,0 +1,240 @@
+name: MBOX signed-entitlements diagnostic
+
+# WHY THIS EXISTS
+#
+# A Mac customer films 1.0.14: archive selected in the picker, Open pressed, sheet
+# dismissed — and the app does nothing. No loading overlay (which is set synchronously on
+# the main actor, so it would have appeared), no alert, no event. The picker never hands
+# the URL over.
+#
+# Every verification we have run so far — locally and on the Apple Silicon runner — built
+# an UNSIGNED binary. Entitlements are applied at signing time, so none of it exercised
+# the sandbox. `mbo.yml` cannot fill the gap either: its entire signing/export block is
+# gated on `build_mode == publish_to_appstore`, so the only way to get a signed Mac build
+# today is to ship it to the App Store. That is exactly how this class of bug stayed
+# invisible for three releases.
+#
+# This workflow produces the signed Mac Catalyst app and reads back what the signature
+# actually granted. It NEVER calls upload_to_app_store — nothing reaches the store.
+#
+# WHAT TO LOOK FOR in the "Read back the signed entitlements" step:
+#   com.apple.security.app-sandbox               = true   (expected)
+#   com.apple.security.files.user-selected.read-only = true
+#
+# If `user-selected.read-only` is MISSING while app-sandbox is true, the app is sandboxed
+# with no file access at all: powerbox will not vend a URL for the file the user picked,
+# the importer returns nothing, and the app appears to ignore the selection. That is the
+# filmed behaviour, and it would be the root cause.
+#
+# If it is present, this hypothesis is dead and the next suspect is mboxRUSH 06a7c38
+# (23 Jul), which changed how the Mac target is declared in project.yml.
+#
+# Delete this workflow from the public repo once the answer is recorded.
+
+on:
+  workflow_dispatch:
+    inputs:
+      repository_url:
+        description: 'owner/repo'
+        required: true
+        type: string
+        default: 'jauntyjsnew/mboxRUSH'
+      repository_branch:
+        description: 'Branch or exact commit SHA'
+        required: false
+        type: string
+        default: 'main'
+      mac_provisioning_profile_base64:
+        description: 'Mac App Store (Catalyst) profile, base64 — paste here, never in chat'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mbox-entitlements-check
+  cancel-in-progress: false
+
+jobs:
+  diagnose:
+    runs-on: macos-latest
+    timeout-minutes: 90
+
+    steps:
+      - uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+
+      - name: Parse Apple credentials
+        id: apple
+        env:
+          APPLE_CREDS: ${{ secrets.APPLE_CREDENTIALS }}
+        run: |
+          TEAM_ID=$(echo "$APPLE_CREDS" | jq -r '.team_id')
+          CERT_B64=$(echo "$APPLE_CREDS" | jq -r '.certificate_base64')
+          CERT_PASS=$(echo "$APPLE_CREDS" | jq -r '.certificate_password')
+          INST_B64=$(echo "$APPLE_CREDS" | jq -r '.installer_certificate_base64 // empty')
+          INST_PASS=$(echo "$APPLE_CREDS" | jq -r '.installer_certificate_password // .certificate_password')
+          for v in "$TEAM_ID" "$CERT_B64" "$CERT_PASS" "$INST_B64" "$INST_PASS"; do
+            [ -n "$v" ] && echo "::add-mask::$v"
+          done
+          {
+            echo "team_id=$TEAM_ID"
+            echo "certificate_base64=$CERT_B64"
+            echo "certificate_password=$CERT_PASS"
+            echo "installer_certificate_base64=$INST_B64"
+            echo "installer_certificate_password=$INST_PASS"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Clone app repo
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.repository_url }}
+          ref: ${{ inputs.repository_branch }}
+          token: ${{ secrets.GH_PAT }}
+          path: app
+
+      - name: Report the exact revision under test
+        working-directory: app
+        run: echo "HEAD = $(git rev-parse HEAD)"
+
+      - name: Rust toolchain (Catalyst targets)
+        run: |
+          rustup target add aarch64-apple-ios-macabi x86_64-apple-ios-macabi \
+                            aarch64-apple-darwin x86_64-apple-darwin
+          if ! command -v cbindgen >/dev/null 2>&1; then cargo install cbindgen; fi
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            app/rust-engine/target
+          key: cargo-${{ runner.os }}-${{ hashFiles('app/rust-engine/Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-
+
+      - name: XcodeGen
+        run: |
+          brew install xcodegen
+          cd app && xcodegen generate
+
+      # A signed archive needs a CFBundleVersion, but nothing here is uploaded, so the
+      # value only has to exist — it is never compared against App Store Connect.
+      - name: Stamp a build number
+        run: |
+          BUILD=$(date -u +%Y%m%d%H%M)
+          PL=app/App/Info.plist
+          /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $BUILD" "$PL" \
+            || /usr/libexec/PlistBuddy -c "Add :CFBundleVersion string $BUILD" "$PL"
+          echo "CFBundleVersion=$BUILD"
+
+      - name: Import signing certificates
+        env:
+          CERT_B64: ${{ steps.apple.outputs.certificate_base64 }}
+          CERT_PASS: ${{ steps.apple.outputs.certificate_password }}
+          INST_B64: ${{ steps.apple.outputs.installer_certificate_base64 }}
+          INST_PASS: ${{ steps.apple.outputs.installer_certificate_password }}
+        run: |
+          KC=$RUNNER_TEMP/app.keychain-db
+          KP=$(openssl rand -base64 24); echo "::add-mask::$KP"
+          security create-keychain -p "$KP" "$KC"
+          security set-keychain-settings -lut 21600 "$KC"
+          security unlock-keychain -p "$KP" "$KC"
+          echo "$CERT_B64" | base64 --decode > $RUNNER_TEMP/cert.p12
+          security import $RUNNER_TEMP/cert.p12 -P "$CERT_PASS" -A -t cert -f pkcs12 -k "$KC"
+          if [ -n "$INST_B64" ]; then
+            echo "$INST_B64" | base64 --decode > $RUNNER_TEMP/inst.p12
+            security import $RUNNER_TEMP/inst.p12 -P "$INST_PASS" -A -t cert -f pkcs12 -k "$KC"
+          fi
+          security list-keychain -d user -s "$KC"
+
+      - name: Install the Mac provisioning profile
+        run: |
+          mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
+          echo "${{ inputs.mac_provisioning_profile_base64 }}" | base64 --decode > $RUNNER_TEMP/mac.provisionprofile
+          PL=$(security cms -D -i $RUNNER_TEMP/mac.provisionprofile)
+          MAC_UUID=$(/usr/libexec/PlistBuddy -c "Print UUID" /dev/stdin <<< "$PL")
+          echo "::add-mask::$MAC_UUID"
+          cp $RUNNER_TEMP/mac.provisionprofile ~/Library/MobileDevice/Provisioning\ Profiles/$MAC_UUID.provisionprofile
+          echo "MAC_PROFILE_UUID=$MAC_UUID" >> "$GITHUB_ENV"
+          # The profile's OWN entitlements are half of the equation: what the signed app
+          # ends up with is the intersection of the entitlements file and this list.
+          echo "── Entitlements the profile authorises ─────────────────────────"
+          /usr/libexec/PlistBuddy -c "Print Entitlements" /dev/stdin <<< "$PL" || true
+          echo "── Profile name / platform ─────────────────────────────────────"
+          /usr/libexec/PlistBuddy -c "Print Name" /dev/stdin <<< "$PL" || true
+          /usr/libexec/PlistBuddy -c "Print Platform" /dev/stdin <<< "$PL" || true
+
+      - name: Build the SIGNED Mac Catalyst app (never uploaded)
+        working-directory: app
+        env:
+          TEAM_ID: ${{ steps.apple.outputs.team_id }}
+        run: |
+          gem install fastlane --no-document
+          SCHEME="MboxRush"
+          BUNDLE_ID=$(/usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" App/Info.plist 2>/dev/null || echo "")
+          [ -z "$BUNDLE_ID" ] || [ "$BUNDLE_ID" == '$(PRODUCT_BUNDLE_IDENTIFIER)' ] && \
+            BUNDLE_ID=$(grep -m1 -A2 "bundleIdPrefix" project.yml >/dev/null && echo "tools.rush.mboxrush")
+          echo "BUNDLE_ID=$BUNDLE_ID"
+          INSTALLER_CERT_NAME=$(security find-identity -v -p basic "$RUNNER_TEMP/app.keychain-db" | grep "3rd Party Mac Developer Installer" | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          [ -z "$INSTALLER_CERT_NAME" ] && INSTALLER_CERT_NAME="3rd Party Mac Developer Installer: $TEAM_ID"
+
+          XCARGS="DEVELOPMENT_TEAM=$TEAM_ID CODE_SIGN_STYLE=Manual CODE_SIGNING_REQUIRED=YES CODE_SIGNING_ALLOWED=YES"
+
+          {
+            echo '<?xml version="1.0" encoding="UTF-8"?>'
+            echo '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">'
+            echo '<plist version="1.0"><dict>'
+            echo '<key>method</key><string>app-store</string>'
+            echo "<key>teamID</key><string>$TEAM_ID</string>"
+            echo '<key>destination</key><string>export</string>'
+            echo '<key>signingStyle</key><string>manual</string>'
+            echo '<key>provisioningProfiles</key><dict>'
+            echo "<key>$BUNDLE_ID</key><string>$MAC_PROFILE_UUID</string>"
+            echo '</dict></dict></plist>'
+          } > macExport.plist
+
+          # Identical to mbo.yml's mac_publish build step, minus upload_to_app_store.
+          fastlane run build_app project:"MboxRush.xcodeproj" scheme:"$SCHEME" \
+            catalyst_platform:"macos" export_method:"app-store" \
+            output_name:"MboxRush-Mac" output_directory:"." \
+            export_options:"macExport.plist" skip_profile_detection:true \
+            installer_cert_name:"$INSTALLER_CERT_NAME" \
+            xcargs:"$XCARGS PROVISIONING_PROFILE_SPECIFIER=$MAC_PROFILE_UUID CODE_SIGN_ENTITLEMENTS=App/MboxRush-macOS.entitlements" \
+            clean:true
+
+      - name: Read back the signed entitlements
+        working-directory: app
+        run: |
+          set +e
+          APP=$(find "$HOME/Library/Developer/Xcode/Archives" . -maxdepth 6 -name "*.app" -type d 2>/dev/null | grep -iv "\.app/" | head -1)
+          if [ -z "$APP" ]; then
+            echo "::error::No .app found to inspect. The archive step above must have failed."
+            find . -maxdepth 3 \( -name "*.pkg" -o -name "*.xcarchive" -o -name "*.app" \) 2>/dev/null | head
+            exit 1
+          fi
+          echo "Inspecting: $APP"
+          echo
+          echo "════════ THE ANSWER ════════"
+          echo "Look for com.apple.security.files.user-selected.read-only below."
+          echo "Missing + app-sandbox true  =  sandboxed with no file access  =  root cause."
+          echo "════════════════════════════"
+          codesign -d --entitlements :- "$APP" 2>&1
+          echo
+          echo "════════ signature detail ════════"
+          codesign -dv --verbose=4 "$APP" 2>&1
+          echo
+          echo "════════ the file we ASKED for ════════"
+          cat App/MboxRush-macOS.entitlements
+
+      - name: Upload the signed app for local inspection
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mbox-signed-mac-${{ github.run_number }}
+          path: |
+            app/*.pkg
+            app/*.app
+          if-no-files-found: warn
