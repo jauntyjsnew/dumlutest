@@ -167,64 +167,46 @@ jobs:
           /usr/libexec/PlistBuddy -c "Print Name" /dev/stdin <<< "$PL" || true
           /usr/libexec/PlistBuddy -c "Print Platform" /dev/stdin <<< "$PL" || true
 
-      - name: Build the SIGNED Mac Catalyst app (never uploaded)
+      # The previous run proved the archive itself signs fine ("ARCHIVE SUCCEEDED") and only
+      # exportArchive failed, because the ExportOptions bundle-id key did not match the app.
+      # Export is not needed here at all: the archive already contains the SIGNED .app, which is
+      # what we want to interrogate. Dropping export removes the whole class of plist mismatches.
+      - name: Archive the SIGNED Mac Catalyst app (no export, never uploaded)
         working-directory: app
         env:
           TEAM_ID: ${{ steps.apple.outputs.team_id }}
         run: |
-          gem install fastlane --no-document
-          SCHEME="MboxRush"
-          BUNDLE_ID=$(/usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" App/Info.plist 2>/dev/null || echo "")
-          [ -z "$BUNDLE_ID" ] || [ "$BUNDLE_ID" == '$(PRODUCT_BUNDLE_IDENTIFIER)' ] && \
-            BUNDLE_ID=$(grep -m1 -A2 "bundleIdPrefix" project.yml >/dev/null && echo "tools.rush.mboxrush")
-          echo "BUNDLE_ID=$BUNDLE_ID"
-          INSTALLER_CERT_NAME=$(security find-identity -v -p basic "$RUNNER_TEMP/app.keychain-db" | grep "3rd Party Mac Developer Installer" | head -1 | sed 's/.*"\(.*\)".*/\1/')
-          [ -z "$INSTALLER_CERT_NAME" ] && INSTALLER_CERT_NAME="3rd Party Mac Developer Installer: $TEAM_ID"
-
-          XCARGS="DEVELOPMENT_TEAM=$TEAM_ID CODE_SIGN_STYLE=Manual CODE_SIGNING_REQUIRED=YES CODE_SIGNING_ALLOWED=YES"
-
-          {
-            echo '<?xml version="1.0" encoding="UTF-8"?>'
-            echo '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">'
-            echo '<plist version="1.0"><dict>'
-            echo '<key>method</key><string>app-store</string>'
-            echo "<key>teamID</key><string>$TEAM_ID</string>"
-            echo '<key>destination</key><string>export</string>'
-            echo '<key>signingStyle</key><string>manual</string>'
-            echo '<key>provisioningProfiles</key><dict>'
-            echo "<key>$BUNDLE_ID</key><string>$MAC_PROFILE_UUID</string>"
-            echo '</dict></dict></plist>'
-          } > macExport.plist
-
-          # Identical to mbo.yml's mac_publish build step, minus upload_to_app_store.
-          fastlane run build_app project:"MboxRush.xcodeproj" scheme:"$SCHEME" \
-            catalyst_platform:"macos" export_method:"app-store" \
-            output_name:"MboxRush-Mac" output_directory:"." \
-            export_options:"macExport.plist" skip_profile_detection:true \
-            installer_cert_name:"$INSTALLER_CERT_NAME" \
-            xcargs:"$XCARGS PROVISIONING_PROFILE_SPECIFIER=$MAC_PROFILE_UUID CODE_SIGN_ENTITLEMENTS=App/MboxRush-macOS.entitlements" \
-            clean:true
+          set -o pipefail
+          xcodebuild archive \
+            -project MboxRush.xcodeproj -scheme MboxRush -configuration Release \
+            -destination 'generic/platform=macOS,variant=Mac Catalyst' \
+            -archivePath "$RUNNER_TEMP/MboxRush.xcarchive" \
+            DEVELOPMENT_TEAM="$TEAM_ID" \
+            CODE_SIGN_STYLE=Manual CODE_SIGNING_REQUIRED=YES CODE_SIGNING_ALLOWED=YES \
+            PROVISIONING_PROFILE_SPECIFIER="$MAC_PROFILE_UUID" \
+            CODE_SIGN_ENTITLEMENTS=App/MboxRush-macOS.entitlements \
+            | tail -40
 
       - name: Read back the signed entitlements
         working-directory: app
         run: |
-          set +e
-          APP=$(find "$HOME/Library/Developer/Xcode/Archives" . -maxdepth 6 -name "*.app" -type d 2>/dev/null | grep -iv "\.app/" | head -1)
+          APP=$(find "$RUNNER_TEMP/MboxRush.xcarchive/Products" -maxdepth 3 -name "*.app" -type d | head -1)
           if [ -z "$APP" ]; then
-            echo "::error::No .app found to inspect. The archive step above must have failed."
-            find . -maxdepth 3 \( -name "*.pkg" -o -name "*.xcarchive" -o -name "*.app" \) 2>/dev/null | head
+            echo "::error::No .app inside the archive."
+            find "$RUNNER_TEMP/MboxRush.xcarchive" -maxdepth 4 | head -30
             exit 1
           fi
           echo "Inspecting: $APP"
+          echo "Bundle id : $(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Contents/Info.plist" 2>/dev/null || /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Info.plist")"
           echo
           echo "════════ THE ANSWER ════════"
           echo "Look for com.apple.security.files.user-selected.read-only below."
           echo "Missing + app-sandbox true  =  sandboxed with no file access  =  root cause."
           echo "════════════════════════════"
-          codesign -d --entitlements :- "$APP" 2>&1
+          codesign -d --entitlements :- "$APP" 2>&1 || true
           echo
           echo "════════ signature detail ════════"
-          codesign -dv --verbose=4 "$APP" 2>&1
+          codesign -dv --verbose=4 "$APP" 2>&1 || true
           echo
           echo "════════ the file we ASKED for ════════"
           cat App/MboxRush-macOS.entitlements
@@ -235,6 +217,5 @@ jobs:
         with:
           name: mbox-signed-mac-${{ github.run_number }}
           path: |
-            app/*.pkg
-            app/*.app
+            ${{ runner.temp }}/MboxRush.xcarchive
           if-no-files-found: warn
