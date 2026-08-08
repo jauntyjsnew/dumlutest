@@ -91,7 +91,16 @@ async function fetchVersions(bundleId, keyId, issuerId, privateKeyPem) {
   if (!apps.data || apps.data.length === 0) {
     throw new Error('App Store Connect has no app with bundle id "' + bundleId + '".');
   }
-  const app = apps.data[0];
+  // filter[bundleId] is not an exact-equality filter, so more than one app can come
+  // back. Taking data[0] blind would resolve the version of a DIFFERENT app and
+  // stamp this binary with it — unrecoverable once uploaded. Demand the exact id.
+  const app = apps.data.find(a => a.attributes && a.attributes.bundleId === bundleId);
+  if (!app) {
+    const seen = apps.data.map(a => (a.attributes && a.attributes.bundleId) || a.id).join(', ');
+    throw new Error(
+      'no app exactly matches bundle id "' + bundleId + '" (the filter returned: ' + seen + ').'
+    );
+  }
 
   const out = [];
   for (const platform of ['IOS', 'MAC_OS']) {
@@ -105,9 +114,54 @@ async function fetchVersions(bundleId, keyId, issuerId, privateKeyPem) {
         versionString: v.attributes.versionString,
         state: v.attributes.appStoreState || v.attributes.appVersionState || 'UNKNOWN',
         platform,
+        source: 'store',
       });
     }
   }
+
+  // ⛔ appStoreVersions is NOT the whole truth about which version numbers are
+  // spent. Delete a version record in App Store Connect and it vanishes from this
+  // list — but Apple's upload service still refuses anything at or below it
+  // ("CFBundleShortVersionString [1.0.5] must be higher than the previously
+  // approved version [1.0.6]", error 90062). That is a 12-minute build thrown away
+  // at the very last step, and it repeats on every run because nothing on the
+  // read side ever learns about 1.0.6.
+  //
+  // preReleaseVersions is the missing source: every binary ever uploaded leaves a
+  // train here carrying its marketing version, and these survive the deletion of
+  // the App Store version record. Merged in as spent, so the resolver bumps past
+  // them.
+  //
+  // Marking them spent does NOT break the "reuse an open version" rule: resolve
+  // asks whether ANY entry at the max is still open, so a real open appStoreVersion
+  // at the same number still wins and is reused. And a train with no version record
+  // is precisely the case the reuse rule does not cover — there is no open record
+  // for the submit tool to target, so stepping over it cannot cause the silent
+  // mismatch that rule exists to prevent.
+  try {
+    const pre = await asc(
+      '/v1/apps/' + app.id + '/preReleaseVersions' +
+      '?fields[preReleaseVersions]=version,platform&limit=200',
+      token
+    );
+    for (const v of pre.data || []) {
+      const vs = v.attributes && v.attributes.version;
+      if (!vs) continue;
+      out.push({
+        versionString: vs,
+        state: 'REPLACED_WITH_NEW_VERSION', // spent — never reuse a number a build already claimed
+        platform: (v.attributes && v.attributes.platform) || 'UNKNOWN',
+        source: 'build',
+      });
+    }
+  } catch (e) {
+    // Additive safety net only. If this endpoint is unavailable the run must behave
+    // exactly as it did before, not die — the store list alone is still correct for
+    // every app whose version records were never deleted.
+    console.log('::warning::Could not read uploaded-build versions (' + e.message +
+      '); falling back to App Store version records only.');
+  }
+
   return { appId: app.id, appName: app.attributes && app.attributes.name, versions: out };
 }
 
@@ -170,7 +224,11 @@ async function main() {
   console.log('App: ' + (info.appName || '?') + '  (' + bundleId + ')');
   console.log('Versions in App Store Connect:');
   for (const v of [...info.versions].sort((a, b) => cmpVersion(b.versionString, a.versionString))) {
-    console.log('  ' + v.platform.padEnd(7) + ' ' + v.versionString.padEnd(10) + ' ' + v.state);
+    // Say which list each row came from. When a number is spent only because a
+    // build once claimed it, that is the whole explanation for the bump — and
+    // without it the log looks like it invented a version out of nowhere.
+    const origin = v.source === 'build' ? '  (uploaded build, no version record)' : '';
+    console.log('  ' + v.platform.padEnd(7) + ' ' + v.versionString.padEnd(10) + ' ' + v.state + origin);
   }
 
   const r = resolveVersion(info.versions);
@@ -183,7 +241,11 @@ async function main() {
 }
 
 if (process.env.AUTOVER_SELFTEST) {
-  module.exports = { cmpVersion, bumpVersion, resolveVersion, CREATE_NEXT };
+  // fetchVersions is exported so the test can drive it against a stubbed fetch.
+  // The version-picking rules are pure and easy to test, but the part that
+  // actually broke in the field was which ROWS reach them — that has to be
+  // covered too, not just eyeballed.
+  module.exports = { cmpVersion, bumpVersion, resolveVersion, CREATE_NEXT, fetchVersions };
 } else {
   main().catch((e) => {
     console.log('::error::Auto Version crashed: ' + (e && e.stack ? e.stack : e));
