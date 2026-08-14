@@ -6,6 +6,20 @@
 //   that version still open for a new build  -> reuse it        (1.0.4 -> 1.0.4)
 //   that version finished / live             -> bump last part  (1.0.3 -> 1.0.4)
 //
+// ⛔ "Still open" is a PER-PLATFORM question, and the run only has to satisfy the
+//    platforms it actually uploads to (TARGET_PLATFORM). Asking "is ANY row at the
+//    max still open" mixes the two tracks, and Apple does not: a version that is
+//    live on one platform is CLOSED for new binaries on that platform, whatever
+//    the other platform's record says.
+//    MEASURED (PstViewer, zomtest run 31784610686, target all_devices):
+//      IOS    6.0.6  READY_FOR_SALE   ← closed
+//      MAC_OS 6.0.6  REJECTED         ← open, and it is what answered "yes"
+//    so this script reused 6.0.6, and twelve minutes later altool refused the iOS
+//    leg twice over — 90062 "must contain a higher version than the previously
+//    approved version [6.0.6]" and 90186 "train version '6.0.6' is closed for new
+//    build submissions". Nothing on the read side learned anything, so every
+//    re-dispatch repeated it.
+//
 // Zero dependencies: ES256 JWT is signed with node:crypto, ASC is called with global fetch.
 
 const crypto = require('node:crypto');
@@ -41,23 +55,61 @@ function bumpVersion(v) {
   return parts.join('.');
 }
 
+const ASC_PLATFORMS = new Set(['IOS', 'MAC_OS']);
+
+/** Which App Store platforms a run actually uploads to, from the workflow's
+ *  `target_platform` input. Anything unrecognised means both — the safe reading,
+ *  since a platform we forget to check is a platform Apple can refuse. */
+function platformsFor(target) {
+  switch (String(target || '').trim()) {
+    case 'macos_only': return ['MAC_OS'];
+    case 'iphone_and_ipad':
+    case 'iphone_only':
+    case 'ipad_only': return ['IOS'];
+    default: return ['IOS', 'MAC_OS'];
+  }
+}
+
 /**
  * @param {{versionString:string, state:string, platform:string}[]} versions
- * @returns {{version:string, reused:boolean, basedOn:string}}
+ * @param {string[]} [platforms] ASC platforms this run will upload to
+ * @returns {{version:string, reused:boolean, basedOn:string, closedOn:string[]}}
  */
-function resolveVersion(versions) {
+function resolveVersion(versions, platforms) {
   if (!versions.length) throw new Error('no versions');
+  const targets = platforms && platforms.length ? platforms : ['IOS', 'MAC_OS'];
+
   let max = versions[0].versionString;
   for (const v of versions) if (cmpVersion(v.versionString, max) > 0) max = v.versionString;
 
   const atMax = versions.filter(v => cmpVersion(v.versionString, max) === 0);
-  // Prefer reuse when in doubt: bumping past an open version would upload a build
-  // that the submit tool can never attach (it targets the open version).
-  const anyOpen = atMax.some(v => !CREATE_NEXT.has(v.state));
 
-  return anyOpen
-    ? { version: max, reused: true, basedOn: max }
-    : { version: bumpVersion(max), reused: false, basedOn: max };
+  // A platform is CLOSED at this version when its own APP STORE VERSION RECORD
+  // there is finished — live, replaced, or developer-rejected. That is the state
+  // Apple checks when it closes a train.
+  //
+  // ⛔ Only `source: 'store'` rows can close a platform. A pre-release row is a
+  //    TestFlight train, and a train does NOT close a version: uploading build 2
+  //    of the same marketing version is ordinary. Those rows exist here to stop
+  //    the MAX from being understated (a version record can be deleted, the train
+  //    cannot) — letting them also close a platform would undo the very rule the
+  //    2026-08-08 fix was careful to preserve, and start skipping open versions.
+  const closedOn = targets.filter(p => atMax.some(v =>
+    v.source !== 'build' &&
+    (v.platform === p || !ASC_PLATFORMS.has(v.platform)) &&
+    CREATE_NEXT.has(v.state)
+  ));
+
+  // Prefer reuse when in doubt: bumping past an open version would upload a build
+  // that the submit tool can never attach (it targets the open version). But that
+  // preference only applies where reuse is POSSIBLE — a closed train refuses the
+  // upload outright, and a build nobody can attach still beats a build that does
+  // not exist.
+  const reusable = closedOn.length === 0 && atMax.some(v => !CREATE_NEXT.has(v.state));
+
+  return reusable
+    ? { version: max, reused: true, basedOn: max, closedOn: [] }
+    : { version: bumpVersion(max), reused: false, basedOn: max, closedOn };
 }
 
 // --- App Store Connect ---
@@ -231,12 +283,31 @@ async function main() {
     console.log('  ' + v.platform.padEnd(7) + ' ' + v.versionString.padEnd(10) + ' ' + v.state + origin);
   }
 
-  const r = resolveVersion(info.versions);
-  console.log(
-    r.reused
-      ? 'Highest is ' + r.basedOn + ' and it is still open for a build → reusing it.'
-      : 'Highest is ' + r.basedOn + ' and it is finished → next is ' + r.version + '.'
-  );
+  const targets = platformsFor(process.env.TARGET_PLATFORM);
+  console.log('Uploading to: ' + targets.join(' + ') +
+    '  (target_platform=' + (process.env.TARGET_PLATFORM || 'unset → both') + ')');
+
+  const r = resolveVersion(info.versions, targets);
+  if (r.closedOn && r.closedOn.length) {
+    // Name the platform that forced the bump, and the record left behind. Without
+    // this the log reads as if the script skipped an open version for no reason —
+    // and the open record IS a real loose end somebody has to close by hand.
+    const stillOpen = info.versions.filter(v =>
+      cmpVersion(v.versionString, r.basedOn) === 0 && !CREATE_NEXT.has(v.state));
+    console.log('Highest is ' + r.basedOn + ', but it is CLOSED on ' + r.closedOn.join(' + ') +
+      ' → Apple would refuse this upload (90062/90186). Next is ' + r.version + '.');
+    for (const v of stillOpen) {
+      console.log('::warning::' + v.platform + ' still has an open ' + v.versionString +
+        ' record (' + v.state + '). This build goes to ' + r.version +
+        ', so update or delete that record in App Store Connect.');
+    }
+  } else {
+    console.log(
+      r.reused
+        ? 'Highest is ' + r.basedOn + ' and it is still open for a build → reusing it.'
+        : 'Highest is ' + r.basedOn + ' and it is finished → next is ' + r.version + '.'
+    );
+  }
   emit(r.version, r.reused ? 'reused open version ' + r.basedOn : 'bumped from ' + r.basedOn);
 }
 
@@ -245,7 +316,7 @@ if (process.env.AUTOVER_SELFTEST) {
   // The version-picking rules are pure and easy to test, but the part that
   // actually broke in the field was which ROWS reach them — that has to be
   // covered too, not just eyeballed.
-  module.exports = { cmpVersion, bumpVersion, resolveVersion, CREATE_NEXT, fetchVersions };
+  module.exports = { cmpVersion, bumpVersion, resolveVersion, platformsFor, CREATE_NEXT, fetchVersions };
 } else {
   main().catch((e) => {
     console.log('::error::Auto Version crashed: ' + (e && e.stack ? e.stack : e));

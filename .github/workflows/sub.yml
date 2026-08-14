@@ -124,6 +124,7 @@ jobs:
           BUNDLE_ID: ${{ env.BUNDLE_ID }}
           MANUAL_VERSION: ${{ inputs.version }}
           BUILD_MODE: ${{ inputs.build_mode }}
+          TARGET_PLATFORM: ${{ inputs.target_platform }}
         run: node "$GITHUB_WORKSPACE/.wf/.github/scripts/autover.cjs"
       - name: Require widget provisioning profile secret
         if: inputs.build_mode == 'publish_to_appstore' && inputs.target_platform != 'macos_only'
