@@ -313,6 +313,100 @@ jobs:
           fi
           echo "USE_COCOAPODS=$USE_COCOAPODS" >> $GITHUB_ENV
       
+      # ── Why this step exists ──────────────────────────────────────────────
+      # MEASURED 2026-08-23, run 32664742253 (p7mViewer, all_devices). The archive
+      # died at
+      #   AppDelegate.swift:3:8: error: unable to resolve module dependency: 'CapApp_SPM'
+      # `SPM Clean` below tears the CapApp-SPM package out of the project and
+      # deletes the directory, because a Catalyst build links its plugins through
+      # CocoaPods instead. Nothing removed the app's own references to that module,
+      # so the App target still asked for a module that no longer existed.
+      #
+      # Capacitor 8's SPM layout lets an app keep its native sources INSIDE
+      # CapApp-SPM/Sources/CapApp-SPM and reach them with `import CapApp_SPM`; the
+      # storyboard then names the same module in customModule. p7mViewer keeps
+      # MainViewController and RushFilePicker there, so the teardown deleted app
+      # code, not just packaging. Both leftovers bite: the import fails the build
+      # outright, and a stale customModule leaves the root view controller
+      # unresolvable at runtime — black screen — even when the build passes.
+      #
+      # igc.yml already carried this step, for the same reason on igcViewer; it was
+      # never folded back here, so every other app in this repo stayed exposed.
+      # This copy is TOLERANT where igc.yml is strict: igcViewer always keeps its
+      # sources in the package, so igc.yml fails when they are missing. Apps whose
+      # sources already live in App/ are just as valid, so here every rescue is
+      # conditional and an app with nothing to move walks through untouched.
+      - name: Preserve app native sources (pre-SPM-teardown)
+        if: env.USE_COCOAPODS == 'true'
+        working-directory: app/ios/App
+        run: |
+          set -euo pipefail
+          SRC="CapApp-SPM/Sources/CapApp-SPM"
+          PRESERVED=0
+          if [ -d "$SRC" ]; then
+            mkdir -p App/Native
+            for f in "$SRC"/*.swift; do
+              [ -e "$f" ] || continue
+              base=$(basename "$f")
+              # The package's own marker file is not app code.
+              [ "$base" = "CapApp-SPM.swift" ] && continue
+              cp "$f" "App/Native/$base"
+              echo "preserved: $base"
+              PRESERVED=$((PRESERVED + 1))
+            done
+            if [ "$PRESERVED" -eq 0 ]; then rmdir App/Native 2>/dev/null || true; fi
+          fi
+          echo "preserved $PRESERVED app native source(s)"
+
+          # The storyboard names the module its root view controller lives in.
+          STORYBOARD="App/Base.lproj/Main.storyboard"
+          if [ -f "$STORYBOARD" ] && grep -q 'customModule="CapApp_SPM"' "$STORYBOARD"; then
+            /usr/bin/sed -i '' 's/customModule="CapApp_SPM"/customModule="App"/g' "$STORYBOARD"
+            if grep -q 'customModule="CapApp_SPM"' "$STORYBOARD"; then
+              echo "::error::storyboard still references CapApp_SPM"; exit 1
+            fi
+            echo "storyboard: customModule CapApp_SPM -> App"
+          fi
+
+          # The import that killed run 32664742253. Everything the app actually uses
+          # through it — Capacitor, Cordova, the plugins — comes from the Pods build,
+          # so dropping the line is enough; App target sources keep `import Capacitor`.
+          HITS=$(grep -rl '^import CapApp_SPM$' App --include="*.swift" 2>/dev/null || true)
+          if [ -n "$HITS" ]; then
+            echo "$HITS" | while read -r f; do
+              /usr/bin/sed -i '' '/^import CapApp_SPM$/d' "$f"
+              echo "dropped import CapApp_SPM: $f"
+            done
+          fi
+          if grep -rq '^import CapApp_SPM$' App --include="*.swift" 2>/dev/null; then
+            echo "::error::import CapApp_SPM survived the rewrite"; exit 1
+          fi
+
+          # Rescued files are on disk but in no target until the project says so.
+          if [ "$PRESERVED" -gt 0 ]; then
+            gem install xcodeproj --no-document >/dev/null 2>&1 || true
+            ruby -e '
+            require "xcodeproj"
+            project = Xcodeproj::Project.open("App.xcodeproj")
+            target = project.targets.find { |t| t.name == "App" }
+            abort("App target not found") unless target
+            group = project.main_group.find_subpath("App/Native", true)
+            group.set_source_tree("SOURCE_ROOT")
+            group.set_path("App/Native")
+            added = 0
+            Dir.glob("App/Native/*.swift").each do |path|
+              name = File.basename(path)
+              next if group.files.any? { |f| f.display_name == name }
+              ref = group.new_reference(name)
+              target.add_file_references([ref])
+              added += 1
+            end
+            project.save
+            puts "added #{added} app native source(s) to the App target"
+            abort("no sources added to App target") if added.zero?
+            '
+          fi
+
       - name: SPM Clean
         if: env.USE_COCOAPODS == 'true'
         working-directory: app/ios/App
