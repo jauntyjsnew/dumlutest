@@ -23,6 +23,10 @@
 #        - A literal, though, is also the dispatch INPUT, and inputs are run
 #          metadata rather than log content. Log deletion does not reach them.
 #          An alias leaves nothing to reach: the public side is `a1`.
+#          (The input is read from $GITHUB_EVENT_PATH rather than passed via
+#          `env:`, because the runner prints a step's env block before the step
+#          can mask anything — so an env var would publish the name in the log
+#          too, ahead of every protection below it.)
 #      Use a literal to get moving; move to aliases for anything you would mind
 #      being enumerable later.
 #
@@ -114,11 +118,20 @@ jobs:
         id: target
         env:
           TARGETS: ${{ secrets.VERIFY_TARGETS }}
-          ALIAS: ${{ inputs.target }}
           FALLBACK_BRANCH: ${{ inputs.branch }}
           FALLBACK_BREW: ${{ inputs.brew_packages }}
         run: |
           set -euo pipefail
+          # ⛔ `target` is read from the event payload on disk, NOT from `env:`.
+          # The runner prints a step's whole env block before the step's first
+          # line runs — i.e. before ::add-mask:: can possibly exist — so passing
+          # it as an env var publishes it verbatim in a public log no matter
+          # what the script does afterwards. MEASURED: the first run of this
+          # workflow printed `ALIAS: <owner>/<repo>` there, and only there.
+          # $GITHUB_EVENT_PATH is a file; nothing echoes it.
+          ALIAS="$(jq -r '.inputs.target // ""' "$GITHUB_EVENT_PATH")"
+          [[ -n "$ALIAS" ]] || { echo "::error::no target given"; exit 1; }
+
           repo=""; branch=""; brew_pkgs=""; scripts=""; how=""
 
           # The secret wins when it knows the alias, so a name that HAS been
