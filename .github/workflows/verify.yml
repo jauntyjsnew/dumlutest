@@ -1,0 +1,345 @@
+# ─── verify — run a private repo's OWN test suite on a real Mac ──────────────
+#
+# WHY IT EXISTS. The agent sessions that edit these projects run on Linux. The
+# native half of a project — anything behind `xcrun`, Swift sources, a compiled
+# C harness — cannot be run there at all, so a session can only ever end with
+# "not verified, needs a Mac". This is that Mac. It checks a project out, runs
+# the test scripts the project already declares in its own package.json, and
+# reports pass/fail.
+#
+# ⛔ IT PROVES NOTHING OF ITS OWN. It runs the project's scripts and reports
+# what they return. Where a project has no test for something, this cannot
+# invent one, and a green run here means exactly "those scripts passed".
+#
+# ⛔ THIS REPOSITORY IS PUBLIC AND THE PROJECTS IT TESTS ARE NOT.
+# Two separate leaks are possible and both are closed here:
+#
+#   1. IDENTITY — which private repo ran. `target` takes EITHER a literal
+#      `owner/repo` or an alias resolved from the VERIFY_TARGETS secret, and
+#      the difference is only about what survives log deletion:
+#        - Either way the name is `::add-mask::`ed the moment it is known, so
+#          it renders as `***` in the log — including in actions/checkout's own
+#          output — and deleting the log removes it entirely regardless.
+#        - A literal, though, is also the dispatch INPUT, and inputs are run
+#          metadata rather than log content. Log deletion does not reach them.
+#          An alias leaves nothing to reach: the public side is `a1`.
+#      Use a literal to get moving; move to aliases for anything you would mind
+#      being enumerable later.
+#
+#   2. CONTENT — the project's own output. No step prints it. Every command's
+#      stdout and stderr goes to a file under $RUNNER_TEMP and the console gets
+#      a PASS/FAIL table. A FAILING step prints a bounded, path-scrubbed tail
+#      (default 60 lines), because a failure nobody can see is a failure nobody
+#      can fix; `failure_tail: 0` turns off even that.
+#
+# What still survives, and cannot be hidden by any design: that a run happened,
+# who dispatched it, its timing, and its final conclusion. Delete the logs after
+# reading them and that is all that is left.
+#
+# ⛔ NOTHING HERE TALKS TO APPLE. No App Store Connect, no altool/notarytool,
+# no fastlane, no signing, no certificates, no APPLE_CREDENTIALS. It builds and
+# it tests. The only secrets it reads are GH_PAT (to check out a private repo)
+# and VERIFY_TARGETS (to know which one). Keep it that way — this is the only
+# workflow here that is safe to point at an arbitrary branch, precisely because
+# it can neither sign nor upload anything.
+#
+# VERIFY_TARGETS format — one line per project, `#` comments and blanks ignored:
+#
+#     alias | owner/repo | branch | brew pkgs | npm scripts
+#
+# Only `alias` and `owner/repo` are required; trailing fields may be empty.
+#   branch      empty -> the `branch` dispatch input, itself defaulting to main
+#   brew pkgs   space separated, installed before the suite runs
+#   npm scripts space separated; empty -> auto-detect every `test:*` script the
+#               project declares, minus the `exclude` pattern
+#
+# ADDITIVE BY CONSTRUCTION. This file reads, imports and modifies no other
+# workflow in this repository. Deleting it removes the capability and changes
+# nothing else.
+
+name: verify
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: 'VERIFY_TARGETS alias (preferred — leaks nothing), or a literal owner/repo'
+        required: true
+        type: string
+
+      branch:
+        description: 'Branch, when the alias line does not pin one'
+        required: false
+        type: string
+        default: 'main'
+
+      brew_packages:
+        description: 'Homebrew formulae the suite needs, when the alias line does not list them'
+        required: false
+        type: string
+        default: ''
+
+      exclude:
+        description: 'Regex of auto-detected script names to skip'
+        required: false
+        type: string
+        default: 'real-avi|:extended|:large'
+
+      typecheck:
+        description: 'Run `npx tsc --noEmit` when a tsconfig.json exists'
+        required: false
+        type: boolean
+        default: true
+
+      failure_tail:
+        description: 'Lines of a failing script to print (0 = print nothing)'
+        required: false
+        type: string
+        default: '60'
+
+# Read-only: checkout uses GH_PAT and nothing here writes to any repository.
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: macos-latest
+    timeout-minutes: 90
+
+    steps:
+      # ⛔ The ONLY step that handles the repo name. It resolves the alias and
+      # registers the result as a masked value, so every later step — including
+      # actions/checkout's own logging — prints `***` instead of the name.
+      - name: Resolve target
+        id: target
+        env:
+          TARGETS: ${{ secrets.VERIFY_TARGETS }}
+          ALIAS: ${{ inputs.target }}
+          FALLBACK_BRANCH: ${{ inputs.branch }}
+          FALLBACK_BREW: ${{ inputs.brew_packages }}
+        run: |
+          set -euo pipefail
+          repo=""; branch=""; brew_pkgs=""; scripts=""; how=""
+
+          # The secret wins when it knows the alias, so a name that HAS been
+          # given an alias can never be reached by typing it in plain.
+          if [[ -n "${TARGETS:-}" ]]; then
+            # ⛔ Compare a trimmed COPY of field 1, never field 1 itself.
+            # Assigning to a field makes awk rebuild the whole record with OFS,
+            # which is a space here — silently deleting every `|` in the line it
+            # is about to print, and only for lines that needed trimming.
+            line="$(printf '%s\n' "$TARGETS" | sed 's/#.*//' | awk -F'|' -v a="$ALIAS" '
+              { k = $1; gsub(/^[ \t]+|[ \t]+$/, "", k) }
+              k == a { print; found = 1; exit }
+              END { if (!found) exit 1 }
+            ')" || line=""
+            if [[ -n "$line" ]]; then
+              # `-s` so a line carrying no `|` yields an empty repo and trips the
+              # owner/repo check below, instead of cut echoing the line back.
+              field() { printf '%s\n' "$line" | cut -s -d'|' -f"$1" | sed 's/^[ \t]*//; s/[ \t]*$//'; }
+              repo="$(field 2)"; branch="$(field 3)"
+              brew_pkgs="$(field 4)"; scripts="$(field 5)"
+              how="alias"
+            fi
+          fi
+
+          # Literal fallback. Deliberately allowed: requiring the secret first
+          # would mean a session that has something to verify RIGHT NOW cannot,
+          # and an unverified change shipped is worse than a repo name sitting
+          # in run metadata for as long as it takes to delete the run.
+          if [[ -z "$repo" && "$ALIAS" == */* ]]; then
+            repo="$ALIAS"
+            how="literal (name is in this run's inputs, which log deletion does NOT remove)"
+          fi
+
+          if [[ -z "$repo" ]]; then
+            echo "::error::target is neither a VERIFY_TARGETS alias nor an owner/repo"
+            exit 1
+          fi
+          [[ "$repo" == */* && "$repo" != */*/* ]] || { echo "::error::target did not resolve to owner/repo"; exit 1; }
+          [[ -n "$branch" ]] || branch="${FALLBACK_BRANCH:-main}"
+          # A formula list is not an identity — "ffmpeg" names a dependency, not
+          # a project — so this one is safe to carry as a plain input when the
+          # alias line does not pin it. The alias line still wins where it does.
+          [[ -n "$brew_pkgs" ]] || brew_pkgs="${FALLBACK_BREW:-}"
+
+          # Mask BEFORE anything can echo it. Both halves separately, so neither
+          # the owner nor the repo name can surface on its own.
+          echo "::add-mask::$repo"
+          echo "::add-mask::${repo%%/*}"
+          echo "::add-mask::${repo##*/}"
+
+          {
+            echo "repo=$repo"
+            echo "branch=$branch"
+            echo "brew_pkgs=$brew_pkgs"
+            echo "scripts=$scripts"
+          } >> "$GITHUB_OUTPUT"
+          echo "target resolved via $how (masked); branch: $branch"
+
+      - name: Check out the project
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ steps.target.outputs.repo }}
+          ref: ${{ steps.target.outputs.branch }}
+          token: ${{ secrets.GH_PAT }}
+          path: app
+
+      # A commit SHA is not a name, and "which commit did this prove?" is the
+      # entire point of the exercise.
+      - name: Record what is under test
+        working-directory: app
+        run: |
+          set -euo pipefail
+          echo "commit under test: $(git rev-parse HEAD)"
+          echo "xcode: $(xcodebuild -version 2>/dev/null | head -1 || echo unknown)"
+          echo "runner: $(uname -m), $(sw_vers -productVersion 2>/dev/null || echo '?')"
+
+      - name: Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Homebrew packages
+        if: steps.target.outputs.brew_pkgs != ''
+        env:
+          PKGS: ${{ steps.target.outputs.brew_pkgs }}
+        run: |
+          set -euo pipefail
+          for pkg in $PKGS; do
+            # Already-present formulae are the common case on a warm image and
+            # `brew install` treats that as an error, so check first; a genuine
+            # install failure still fails the job.
+            if brew list --formula "$pkg" >/dev/null 2>&1; then
+              echo "$pkg: already present"
+            else
+              brew install "$pkg"
+            fi
+          done
+
+      # ⛔ npm ci, then the two fallbacks, in that order. Some of these projects
+      # carry a peer-dependency conflict that `npm ci` refuses and that has
+      # nothing to do with the change under test; failing the whole verification
+      # on it would break this workflow exactly when it is needed. Which path
+      # won is reported, because "installed with --legacy-peer-deps" is a fact
+      # about the run.
+      - name: Install dependencies
+        working-directory: app
+        run: |
+          set -uo pipefail
+          LOG="$RUNNER_TEMP/npm-install.log"
+          if [[ ! -f package.json ]]; then
+            echo "no package.json — skipping"
+            exit 0
+          fi
+          for mode in "ci" "ci --legacy-peer-deps" "install --legacy-peer-deps"; do
+            if npm $mode --no-audit --no-fund >"$LOG" 2>&1; then
+              echo "dependencies installed: npm $mode"
+              exit 0
+            fi
+          done
+          echo "::error::dependency install failed under all three strategies"
+          tail -n 40 "$LOG" | sed -e "s#$GITHUB_WORKSPACE#<ws>#g" -e "s#$HOME#~#g"
+          exit 1
+
+      # One step runs everything, so the PASS/FAIL table is one contiguous block
+      # rather than something a reader has to reassemble from step headers.
+      - name: Run the suite
+        working-directory: app
+        env:
+          SCRIPTS_IN: ${{ steps.target.outputs.scripts }}
+          EXCLUDE_IN: ${{ inputs.exclude }}
+          TYPECHECK_IN: ${{ inputs.typecheck }}
+          TAIL_IN: ${{ inputs.failure_tail }}
+        run: |
+          set -uo pipefail
+          OUT="$RUNNER_TEMP/out"; mkdir -p "$OUT"
+          TAIL="${TAIL_IN:-60}"; [[ "$TAIL" =~ ^[0-9]+$ ]] || TAIL=60
+
+          # ⛔ Path scrubbing, not content filtering. It strips the runner's own
+          # absolute paths so a printed line cannot map the checkout layout. It
+          # does NOT pretend to sanitise arbitrary project output — which is
+          # exactly why the tail is bounded and only ever printed on a failure.
+          scrub() { sed -e "s#$GITHUB_WORKSPACE#<ws>#g" -e "s#$RUNNER_TEMP#<tmp>#g" -e "s#$HOME#~#g"; }
+
+          PASS=(); FAIL=(); SKIP=()
+
+          run_one() {           # run_one <label> <command...>
+            local label="$1"; shift
+            local log="$OUT/${label//[^A-Za-z0-9._-]/_}.log"
+            local started=$SECONDS
+            if "$@" >"$log" 2>&1; then
+              PASS+=("$label")
+              printf '  PASS  %-28s %ss\n' "$label" "$((SECONDS - started))"
+            else
+              FAIL+=("$label")
+              printf '  FAIL  %-28s %ss\n' "$label" "$((SECONDS - started))"
+              if [[ "$TAIL" -gt 0 ]]; then
+                echo "  ---- last $TAIL lines of $label ----"
+                tail -n "$TAIL" "$log" | scrub | sed 's/^/  | /'
+                echo "  ---- end $label ----"
+              fi
+            fi
+          }
+
+          echo "results"
+          echo "-------"
+
+          if [[ "$TYPECHECK_IN" == "true" && -f tsconfig.json ]]; then
+            run_one "tsc --noEmit" npx tsc --noEmit
+          else
+            SKIP+=("tsc --noEmit")
+          fi
+
+          # Which scripts: the alias line's list, or every `test:*` the project
+          # declares minus the exclude pattern. Auto-detection is the reusable
+          # default — a project that adds a test script gets it run here without
+          # this file being edited.
+          if [[ -n "${SCRIPTS_IN// /}" ]]; then
+            read -r -a NAMES <<< "$SCRIPTS_IN"
+          else
+            # ⛔ A while-read loop, not `mapfile`. macOS still ships bash 3.2 as
+            # /bin/bash and `mapfile` is a bash 4 builtin: on a runner that
+            # resolves to it, mapfile fails, NAMES stays empty, and the job
+            # would report "nothing was verified" for a reason that has nothing
+            # to do with the project under test.
+            NAMES=()
+            while IFS= read -r found; do
+              [[ -n "$found" ]] && NAMES+=("$found")
+            done < <(node -e '
+              const s = require("./package.json").scripts || {};
+              const re = process.argv[1] ? new RegExp(process.argv[1]) : null;
+              for (const k of Object.keys(s))
+                if (/^test(:|$)/.test(k) && !(re && re.test(k))) console.log(k);
+            ' "$EXCLUDE_IN" 2>/dev/null || true)
+          fi
+
+          if [[ ${#NAMES[@]} -eq 0 ]]; then
+            echo "::error::no npm test scripts selected — nothing was verified"
+            exit 1
+          fi
+
+          for name in "${NAMES[@]}"; do
+            [[ -n "$name" ]] || continue
+            if ! node -e 'process.exit((require("./package.json").scripts||{})[process.argv[1]]?0:1)' "$name"; then
+              SKIP+=("$name (not declared)")
+              printf '  SKIP  %-28s not declared in package.json\n' "$name"
+              continue
+            fi
+            run_one "$name" npm run "$name"
+          done
+
+          echo
+          echo "summary: ${#PASS[@]} passed, ${#FAIL[@]} failed, ${#SKIP[@]} skipped"
+          for x in ${SKIP[@]+"${SKIP[@]}"}; do echo "  skipped: $x"; done
+
+          # The run's own conclusion carries the verdict, so it stays readable
+          # after the logs have been deleted.
+          [[ ${#FAIL[@]} -eq 0 ]]
+
+      # ⛔ Never `if: success()`. A failed suite is exactly when someone reaches
+      # for the logs, and leaving the project's captured output on disk for some
+      # later step to upload is how a public artifact happens by accident.
+      - name: Shred captured output
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/out" "$RUNNER_TEMP/npm-install.log" || true
