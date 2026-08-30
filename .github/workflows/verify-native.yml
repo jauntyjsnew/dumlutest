@@ -258,7 +258,10 @@ jobs:
           CARGO_ARGS: ${{ inputs.cargo_args }}
           RUNS_IN: ${{ inputs.runs }}
           TAIL_IN: ${{ inputs.failure_tail }}
-          RUNNER_ARCH: ${{ steps.env.outputs.arch }}
+          # ⛔ NOT `RUNNER_ARCH`. GitHub defines that itself as "X64"/"ARM64" and it wins,
+          #    so the summary printed a label instead of the `uname -m` this step measured —
+          #    the one line whose whole job is to say which machine actually ran the slice.
+          MEASURED_ARCH: ${{ steps.env.outputs.arch }}
         run: |
           set -uo pipefail
           export PATH="$HOME/.cargo/bin:$PATH"
@@ -279,7 +282,7 @@ jobs:
           echo
 
           PASS=(); FAIL=()
-          echo "results  (runner ${RUNNER_ARCH}, ${RUNS} run(s) per target)"
+          echo "results  (runner ${MEASURED_ARCH}, ${RUNS} run(s) per target)"
           echo "-------"
 
           for t in $TARGETS_IN; do
@@ -297,7 +300,7 @@ jobs:
               # not a skip — it is "this slice was not verified", and it must fail.
               if grep -qE 'Bad CPU type|cannot execute binary|Exec format error' "$log"; then
                 rc=1
-                echo "::error::$t binaries could not be executed on a ${RUNNER_ARCH} runner — dispatch with an Intel runner label"
+                echo "::error::$t binaries could not be executed on a ${MEASURED_ARCH} runner — dispatch with an Intel runner label"
               fi
               passed="$(grep -oE 'test result: ok\. [0-9]+' "$log" | awk '{s+=$4} END{print s+0}')"
               if [[ $rc -eq 0 ]]; then
@@ -316,7 +319,7 @@ jobs:
           done
 
           echo
-          echo "summary: ${#PASS[@]} passed, ${#FAIL[@]} failed  (runner arch ${RUNNER_ARCH})"
+          echo "summary: ${#PASS[@]} passed, ${#FAIL[@]} failed  (runner arch ${MEASURED_ARCH})"
           [[ ${#FAIL[@]} -eq 0 ]]
 
       # ⛔ Never `if: success()`. See verify.yml.
