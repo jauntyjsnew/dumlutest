@@ -94,7 +94,7 @@ on:
         default: ''
 
       cargo_args:
-        description: 'Extra args appended to every cargo test invocation'
+        description: 'Extra args appended to every cargo test. --no-fail-fast is ALREADY applied; repeating it makes cargo reject the command'
         required: false
         type: string
         default: ''
@@ -264,6 +264,13 @@ jobs:
           MEASURED_ARCH: ${{ steps.env.outputs.arch }}
         run: |
           set -uo pipefail
+          # ⛔ GitHub starts this step as `bash -e {0}`, and `set -uo pipefail` does NOT
+          #    clear an `-e` that is already on. So the FIRST failing `cargo test` killed
+          #    the step before `rc=$?` could run: no FAIL row, no test count, no tail —
+          #    just "Process completed with exit code 1". This step exists to say WHICH
+          #    target failed and why, and it could not do that for any failure at all.
+          #    Every non-zero exit here is handled explicitly below; `-e` must be off.
+          set +e
           export PATH="$HOME/.cargo/bin:$PATH"
           OUT="$RUNNER_TEMP/out"; mkdir -p "$OUT"
           TAIL="${TAIL_IN:-80}"; [[ "$TAIL" =~ ^[0-9]+$ ]] || TAIL=80
