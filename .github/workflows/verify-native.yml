@@ -1,0 +1,325 @@
+# ─── verify-native — run a private repo's Rust engine on a real Mac ──────────
+#
+# WHY IT EXISTS. `verify.yml` runs the npm scripts a project declares, and that
+# is the whole of what it can see. The projects whose entire product IS a Rust
+# engine declare no npm test script at all, so the Mac verifier has been blind
+# to exactly the code that most needs a Mac.
+#
+# ⛔ AND ONE TARGET CANNOT BE HONESTLY TESTED ANYWHERE ELSE.
+# `x86_64-apple-ios-macabi` — Mac Catalyst on an Intel Mac — links the legacy
+# BSD symbols instead of the `$INODE64` variants, so `struct stat` and
+# `struct dirent` are decoded at the wrong offsets. Measured consequences:
+# `metadata().len()` is 0 for every file, `Path::is_dir()` answers for the wrong
+# kind, and iterating `read_dir` over a real directory can walk off the end and
+# take the process down with SIGSEGV. NONE of it reproduces on the host target,
+# on iOS, or on Apple Silicon — where the plain symbols already ARE the modern
+# ABI. A suite that is green everywhere else is not evidence about that slice.
+#
+# So this workflow runs the suite once per Rust target and reports each
+# separately, and it says which architecture the runner actually was, because a
+# run of an x86_64 slice on an arm64 machine is a different claim.
+#
+# ⛔ IT PROVES NOTHING OF ITS OWN. It runs the project's tests and reports what
+# they return. Where a project has no test for something, this cannot invent one.
+#
+# ⛔ NO SILENT SKIPS — this workflow's own rule and the reason it exists.
+# A missing tool, a missing fixture, a target that could not be executed: each
+# is a FAILURE naming what is missing, never a quiet pass. `fixtures` runs the
+# project's own bootstrap script before the suite so "the corpus isn't here" is
+# not a reason for anything.
+#
+# ⛔ SAME PRIVACY CONTRACT AS verify.yml, for the same reasons. The repo name is
+# read from the event payload and `::add-mask::`ed before anything can echo it;
+# no step prints project output; a failing target prints a bounded,
+# path-scrubbed tail; captured output is shredded at the end. Nothing here talks
+# to Apple — no signing, no App Store Connect, no fastlane. The only secrets
+# read are GH_PAT and VERIFY_TARGETS.
+#
+# VERIFY_TARGETS is shared with verify.yml and its 5th field (npm scripts) is
+# ignored here. Rust settings come from this workflow's own inputs.
+#
+# ADDITIVE BY CONSTRUCTION. Reads, imports and modifies no other workflow.
+
+name: verify-native
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: 'VERIFY_TARGETS alias (preferred — leaks nothing), or a literal owner/repo'
+        required: true
+        type: string
+
+      branch:
+        description: 'Branch, when the alias line does not pin one'
+        required: false
+        type: string
+        default: 'main'
+
+      runner:
+        description: 'Runner label. Intel is the point for x86_64-apple-ios-macabi.'
+        required: false
+        type: choice
+        options: ['macos-15-intel', 'macos-13', 'macos-latest', 'macos-15', 'macos-14']
+        default: 'macos-15-intel'
+
+      manifest:
+        description: 'Path to Cargo.toml (empty = find the shallowest one, ignoring vendor/ and wasm)'
+        required: false
+        type: string
+        default: ''
+
+      rust_targets:
+        description: 'Space separated. `host` means the runner default.'
+        required: false
+        type: string
+        default: 'host x86_64-apple-ios-macabi'
+
+      fixtures:
+        description: 'Project script to run before the suite, e.g. rust-engine/tools/fetch-fixtures.sh'
+        required: false
+        type: string
+        default: ''
+
+      brew_packages:
+        description: 'Homebrew formulae the suite needs (e.g. libpst for the readpst oracle)'
+        required: false
+        type: string
+        default: ''
+
+      pip_packages:
+        description: 'pip packages the suite needs (e.g. libpff-python for the pypff oracle)'
+        required: false
+        type: string
+        default: ''
+
+      cargo_args:
+        description: 'Extra args appended to every cargo test invocation'
+        required: false
+        type: string
+        default: ''
+
+      runs:
+        description: 'How many times to run each target. 2 catches a suite that is green only on a clean machine.'
+        required: false
+        type: string
+        default: '2'
+
+      failure_tail:
+        description: 'Lines of a failing run to print (0 = print nothing)'
+        required: false
+        type: string
+        default: '80'
+
+permissions:
+  contents: read
+
+jobs:
+  verify-native:
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 120
+
+    steps:
+      # ⛔ The ONLY step that handles the repo name. See verify.yml for why the
+      # input is read from the event payload on disk and never from `env:`.
+      - name: Resolve target
+        id: target
+        env:
+          TARGETS: ${{ secrets.VERIFY_TARGETS }}
+          FALLBACK_BRANCH: ${{ inputs.branch }}
+        run: |
+          set -euo pipefail
+          ALIAS="$(jq -r '.inputs.target // ""' "$GITHUB_EVENT_PATH")"
+          [[ -n "$ALIAS" ]] || { echo "::error::no target given"; exit 1; }
+
+          repo=""; branch=""; how=""
+          if [[ -n "${TARGETS:-}" ]]; then
+            line="$(printf '%s\n' "$TARGETS" | sed 's/#.*//' | awk -F'|' -v a="$ALIAS" '
+              { k = $1; gsub(/^[ \t]+|[ \t]+$/, "", k) }
+              k == a { print; found = 1; exit }
+              END { if (!found) exit 1 }
+            ')" || line=""
+            if [[ -n "$line" ]]; then
+              field() { printf '%s\n' "$line" | cut -s -d'|' -f"$1" | sed 's/^[ \t]*//; s/[ \t]*$//'; }
+              repo="$(field 2)"; branch="$(field 3)"
+              how="alias"
+            fi
+          fi
+          if [[ -z "$repo" && "$ALIAS" == */* ]]; then
+            repo="$ALIAS"
+            how="literal (name is in this run's inputs, which log deletion does NOT remove)"
+          fi
+          [[ -n "$repo" ]] || { echo "::error::target is neither a VERIFY_TARGETS alias nor an owner/repo"; exit 1; }
+          [[ "$repo" == */* && "$repo" != */*/* ]] || { echo "::error::target did not resolve to owner/repo"; exit 1; }
+          [[ -n "$branch" ]] || branch="${FALLBACK_BRANCH:-main}"
+
+          echo "::add-mask::$repo"
+          echo "::add-mask::${repo%%/*}"
+          echo "::add-mask::${repo##*/}"
+          { echo "repo=$repo"; echo "branch=$branch"; } >> "$GITHUB_OUTPUT"
+          echo "target resolved via $how (masked); branch: $branch"
+
+      - name: Check out the project
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ steps.target.outputs.repo }}
+          ref: ${{ steps.target.outputs.branch }}
+          token: ${{ secrets.GH_PAT }}
+          path: app
+
+      # ⛔ The architecture is part of the verdict, not trivia. `x86_64-apple-ios-macabi`
+      # green on an arm64 runner is a weaker claim than the same line on Intel,
+      # and the summary has to be readable months later without this context.
+      - name: Record what is under test
+        id: env
+        working-directory: app
+        run: |
+          set -euo pipefail
+          echo "commit under test: $(git rev-parse HEAD)"
+          ARCH="$(uname -m)"
+          echo "runner label: ${{ inputs.runner }}"
+          echo "runner arch:  $ARCH"
+          echo "macOS:        $(sw_vers -productVersion 2>/dev/null || echo '?')"
+          echo "xcode:        $(xcodebuild -version 2>/dev/null | head -1 || echo unknown)"
+          echo "arch=$ARCH" >> "$GITHUB_OUTPUT"
+
+      - name: Rust toolchain
+        run: |
+          set -euo pipefail
+          if ! command -v cargo >/dev/null 2>&1; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+            export PATH="$HOME/.cargo/bin:$PATH"
+          fi
+          rustc -V
+          for t in ${{ inputs.rust_targets }}; do
+            [[ "$t" == "host" ]] && continue
+            rustup target add "$t"
+          done
+          rustup target list --installed
+
+      - name: Homebrew packages
+        if: inputs.brew_packages != ''
+        env:
+          PKGS: ${{ inputs.brew_packages }}
+        run: |
+          set -euo pipefail
+          for pkg in $PKGS; do
+            if brew list --formula "$pkg" >/dev/null 2>&1; then
+              echo "$pkg: already present"
+            else
+              brew install "$pkg"
+            fi
+          done
+
+      # ⛔ Into the `python3` the tests will actually call. A venv is invisible to
+      # a suite that shells out to `python3`, which is how these oracles are used.
+      - name: pip packages
+        if: inputs.pip_packages != ''
+        env:
+          PKGS: ${{ inputs.pip_packages }}
+        run: |
+          set -euo pipefail
+          python3 -m pip install --break-system-packages --disable-pip-version-check $PKGS \
+            || python3 -m pip install --disable-pip-version-check $PKGS
+          for p in $PKGS; do
+            mod="${p%%[<>=]*}"; mod="${mod//-python/}"; mod="${mod//-/_}"
+            python3 -c "import $mod" 2>/dev/null && echo "$mod: importable" || echo "$mod: installed (import name differs)"
+          done
+
+      # ⛔ The project's own bootstrap. "The fixtures are not on this machine" is
+      # not a reason to skip a test; it is a reason to run the script that fetches
+      # them. Its output is captured like everything else.
+      - name: Fixtures
+        if: inputs.fixtures != ''
+        working-directory: app
+        env:
+          FIXTURES: ${{ inputs.fixtures }}
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.cargo/bin:$PATH"
+          LOG="$RUNNER_TEMP/fixtures.log"
+          if [[ ! -x "$FIXTURES" ]]; then
+            [[ -f "$FIXTURES" ]] || { echo "::error::fixtures script not found in the project: $FIXTURES"; exit 1; }
+            chmod +x "$FIXTURES"
+          fi
+          if ! "./$FIXTURES" >"$LOG" 2>&1; then
+            echo "::error::the project's fixture bootstrap failed"
+            tail -n 40 "$LOG" | sed -e "s#$GITHUB_WORKSPACE#<ws>#g" -e "s#$HOME#~#g"
+            exit 1
+          fi
+          echo "fixtures: ok ($(wc -l <"$LOG" | tr -d ' ') lines captured)"
+
+      - name: Run cargo test per target
+        working-directory: app
+        env:
+          MANIFEST_IN: ${{ inputs.manifest }}
+          TARGETS_IN: ${{ inputs.rust_targets }}
+          CARGO_ARGS: ${{ inputs.cargo_args }}
+          RUNS_IN: ${{ inputs.runs }}
+          TAIL_IN: ${{ inputs.failure_tail }}
+          RUNNER_ARCH: ${{ steps.env.outputs.arch }}
+        run: |
+          set -uo pipefail
+          export PATH="$HOME/.cargo/bin:$PATH"
+          OUT="$RUNNER_TEMP/out"; mkdir -p "$OUT"
+          TAIL="${TAIL_IN:-80}"; [[ "$TAIL" =~ ^[0-9]+$ ]] || TAIL=80
+          RUNS="${RUNS_IN:-2}"; [[ "$RUNS" =~ ^[1-9][0-9]*$ ]] || RUNS=2
+          scrub() { sed -e "s#$GITHUB_WORKSPACE#<ws>#g" -e "s#$RUNNER_TEMP#<tmp>#g" -e "s#$HOME#~#g"; }
+
+          MANIFEST="$MANIFEST_IN"
+          if [[ -z "$MANIFEST" ]]; then
+            # Shallowest Cargo.toml that is not vendored and not a wasm engine.
+            MANIFEST="$(find . -name Cargo.toml -not -path '*/target/*' -not -path '*/node_modules/*' \
+              -not -path '*/vendor/*' -not -path '*wasm*' -maxdepth 4 2>/dev/null \
+              | awk '{ print gsub(/\//,"/"), $0 }' | sort -n | head -1 | cut -d' ' -f2-)"
+          fi
+          [[ -n "$MANIFEST" && -f "$MANIFEST" ]] || { echo "::error::no Cargo.toml found — is this a Rust project?"; exit 1; }
+          echo "manifest: $MANIFEST"
+          echo
+
+          PASS=(); FAIL=()
+          echo "results  (runner ${RUNNER_ARCH}, ${RUNS} run(s) per target)"
+          echo "-------"
+
+          for t in $TARGETS_IN; do
+            for n in $(seq 1 "$RUNS"); do
+              label="$t #$n"
+              log="$OUT/${t//[^A-Za-z0-9._-]/_}-$n.log"
+              started=$SECONDS
+              if [[ "$t" == "host" ]]; then
+                cargo test --manifest-path "$MANIFEST" --no-fail-fast $CARGO_ARGS >"$log" 2>&1
+              else
+                cargo test --manifest-path "$MANIFEST" --target "$t" --no-fail-fast $CARGO_ARGS >"$log" 2>&1
+              fi
+              rc=$?
+              # A cargo target whose binary cannot execute at all is not a pass and
+              # not a skip — it is "this slice was not verified", and it must fail.
+              if grep -qE 'Bad CPU type|cannot execute binary|Exec format error' "$log"; then
+                rc=1
+                echo "::error::$t binaries could not be executed on a ${RUNNER_ARCH} runner — dispatch with an Intel runner label"
+              fi
+              passed="$(grep -oE 'test result: ok\. [0-9]+' "$log" | awk '{s+=$4} END{print s+0}')"
+              if [[ $rc -eq 0 ]]; then
+                PASS+=("$label")
+                printf '  PASS  %-34s %4s tests  %ss\n' "$label" "$passed" "$((SECONDS - started))"
+              else
+                FAIL+=("$label")
+                printf '  FAIL  %-34s %4s tests  %ss\n' "$label" "$passed" "$((SECONDS - started))"
+                if [[ "$TAIL" -gt 0 ]]; then
+                  echo "  ---- last $TAIL lines of $label ----"
+                  tail -n "$TAIL" "$log" | scrub | sed 's/^/  | /'
+                  echo "  ---- end $label ----"
+                fi
+              fi
+            done
+          done
+
+          echo
+          echo "summary: ${#PASS[@]} passed, ${#FAIL[@]} failed  (runner arch ${RUNNER_ARCH})"
+          [[ ${#FAIL[@]} -eq 0 ]]
+
+      # ⛔ Never `if: success()`. See verify.yml.
+      - name: Shred captured output
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/out" "$RUNNER_TEMP/fixtures.log" || true
