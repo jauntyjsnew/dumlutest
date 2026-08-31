@@ -345,7 +345,9 @@ jobs:
             rustup target add aarch64-apple-ios-macabi x86_64-apple-ios-macabi >/dev/null
           fi
 
-          cargo test --manifest-path "$ENGINE/Cargo.toml" --workspace --no-fail-fast
+          # ⛔ Motor süitini BURADA koşturma. `verify-native.yml` zaten host'ta ve
+          #    `x86_64-apple-ios-macabi`'de koşuyor — yayın hattında tekrarlamak
+          #    yalnız süre yakar, ve Catalyst güvencesini o workflow veriyor.
 
           # build-ios.sh'ı, Xcode'un vereceği env ile, gereken her platform
           # için çağır. Xcode Run Script fazı biçimindeki script'ler (kanonik:
@@ -405,10 +407,14 @@ jobs:
           USE_COCOAPODS="false"
           if [ "$CAP_MAJOR" -ge 8 ] && [ "$NEEDS_CATALYST" == "true" ]; then
             USE_COCOAPODS="true"
-            if [ ! -d "ios" ]; then npx cap add ios --packagemanager cocoapods 2>/dev/null || npx cap add ios; fi
+            # ⛔ `-d ios` YETMEZ: bir repo `ios/App/App/...` altında yalnız overlay
+            #    dosyaları (MainViewController.swift, Plugins/) taşıyor olabilir —
+            #    o zaman dizin VAR ama Xcode projesi YOK, üretim atlanır ve
+            #    `cap sync` hiç var olmayan bir projeye koşar. Projenin kendisine bak.
+            if [ ! -d "ios/App/App.xcodeproj" ]; then npx cap add ios --packagemanager cocoapods 2>/dev/null || npx cap add ios; fi
             npx cap sync ios --packagemanager cocoapods 2>/dev/null || npx cap sync ios
           else
-            if [ ! -d "ios" ]; then npx cap add ios; fi
+            if [ ! -d "ios/App/App.xcodeproj" ]; then npx cap add ios; fi
             npx cap sync ios
           fi
           echo "USE_COCOAPODS=$USE_COCOAPODS" >> $GITHUB_ENV
