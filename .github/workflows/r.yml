@@ -217,9 +217,34 @@ jobs:
               WASM_OUT_DIR="src/wasm/${ENGINE_NAME}-engine"
             fi
           fi
+          # ⛔ Yukarısı YALNIZ wasm motorunu tanır (`rust/<ad>-wasm-engine`).
+          #    Native staticlib motorlar `rust-engine/` altında yaşar ve kendi
+          #    `build-ios.sh`'ını taşır; bu blok eklenene kadar HAS_RUST false
+          #    kalıyor, motor CI'da HİÇ derlenmiyor ve app motorsuz çıkıyordu.
+          HAS_NATIVE_RUST="false"
+          NATIVE_ENGINE_DIR=""
+          NATIVE_BUILD_SCRIPT=""
+          for cand in rust-engine ios/rust-engine engine; do
+            if [ -f "$cand/Cargo.toml" ] && [ -f "$cand/build-ios.sh" ]; then
+              HAS_NATIVE_RUST="true"; NATIVE_ENGINE_DIR="$cand"; NATIVE_BUILD_SCRIPT="$cand/build-ios.sh"; break
+            fi
+          done
+          # Bir alt kademe (step-viewer-converter: rust-engine/step-rush/build-ios.sh)
+          if [ "$HAS_NATIVE_RUST" != "true" ]; then
+            s=$(find . -mindepth 2 -maxdepth 3 -name build-ios.sh -not -path './node_modules/*' 2>/dev/null | head -1)
+            if [ -n "$s" ] && [ -f "$(dirname "$s")/Cargo.toml" ]; then
+              HAS_NATIVE_RUST="true"; NATIVE_ENGINE_DIR="$(dirname "$s")"; NATIVE_BUILD_SCRIPT="$s"
+            fi
+          fi
+          NATIVE_INJECTOR="$(ls scripts/inject-*.rb 2>/dev/null | head -1 || true)"
           echo "has_rust=$HAS_RUST" >> $GITHUB_OUTPUT
           echo "rust_engine_dir=$RUST_ENGINE_DIR" >> $GITHUB_OUTPUT
           echo "wasm_out_dir=$WASM_OUT_DIR" >> $GITHUB_OUTPUT
+          echo "has_native_rust=$HAS_NATIVE_RUST" >> $GITHUB_OUTPUT
+          echo "native_engine_dir=$NATIVE_ENGINE_DIR" >> $GITHUB_OUTPUT
+          echo "native_build_script=$NATIVE_BUILD_SCRIPT" >> $GITHUB_OUTPUT
+          echo "native_injector=$NATIVE_INJECTOR" >> $GITHUB_OUTPUT
+          echo "engine: wasm=$HAS_RUST native=$HAS_NATIVE_RUST ${NATIVE_ENGINE_DIR:+($NATIVE_ENGINE_DIR)}"
       
       - uses: actions/setup-node@v4
         with:
@@ -244,7 +269,7 @@ jobs:
           fi
       
       - name: Cargo Cache
-        if: steps.features.outputs.has_rust == 'true'
+        if: steps.features.outputs.has_rust == 'true' || steps.features.outputs.has_native_rust == 'true'
         uses: actions/cache@v4
         with:
           path: |
@@ -253,19 +278,23 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             app/${{ steps.features.outputs.rust_engine_dir }}/target
+            app/${{ steps.features.outputs.native_engine_dir }}/target
           key: cargo-${{ runner.os }}-${{ hashFiles('app/**/Cargo.lock', 'app/**/Cargo.toml') }}
           restore-keys: cargo-${{ runner.os }}-
       
       - name: Rust
-        if: steps.features.outputs.has_rust == 'true'
+        if: steps.features.outputs.has_rust == 'true' || steps.features.outputs.has_native_rust == 'true'
         run: |
-          if command -v rustc &>/dev/null && command -v wasm-pack &>/dev/null; then
-            rustc --version
-            wasm-pack --version
-          else
+          if ! command -v rustc &>/dev/null; then
             curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-            source $HOME/.cargo/env
-            cargo install wasm-pack
+          fi
+          source $HOME/.cargo/env 2>/dev/null || true
+          rustc --version
+          # wasm-pack YALNIZ wasm motoru için gerekir; native staticlib motorda
+          # kurmak dakikalarca derleme demek.
+          if [ "${{ steps.features.outputs.has_rust }}" == "true" ]; then
+            command -v wasm-pack &>/dev/null || cargo install wasm-pack
+            wasm-pack --version
           fi
 
       - name: WASM
@@ -284,6 +313,77 @@ jobs:
       - name: Build
         working-directory: app
         run: ${{ inputs.npm_build_command }}
+      
+      - name: Native Engine
+        if: steps.features.outputs.has_native_rust == 'true'
+        working-directory: app
+        env:
+          NATIVE_ENGINE_DIR: ${{ steps.features.outputs.native_engine_dir }}
+          NATIVE_BUILD_SCRIPT: ${{ steps.features.outputs.native_build_script }}
+          TARGET_PLATFORM: ${{ inputs.target_platform }}
+        run: |
+          set -euo pipefail
+          source "$HOME/.cargo/env" 2>/dev/null || true
+
+          ENGINE="$NATIVE_ENGINE_DIR"
+          SCRIPT="$NATIVE_BUILD_SCRIPT"
+
+          # ⛔ LTO release'te AÇIK olamaz: #[no_mangle] FFI sembolleri
+          #    staticlib'den silinir ve arşiv linki App Store aşamasında
+          #    patlar — simülatörde fark edilmez.
+          if grep -Eq '^[[:space:]]*lto[[:space:]]*=[[:space:]]*(true|"fat"|"thin")' "$ENGINE/Cargo.toml"; then
+            echo "::error::$ENGINE/Cargo.toml keeps release LTO on; the #[no_mangle] FFI symbols will be stripped"
+            exit 1
+          fi
+
+          rustup target add aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios >/dev/null
+          NEEDS_CATALYST=false
+          case "$TARGET_PLATFORM" in all_devices|macos_only) NEEDS_CATALYST=true ;; esac
+          if [ "$NEEDS_CATALYST" = true ]; then
+            # ⛔ Mac'ler hem Apple Silicon hem Intel. Catalyst dilimi tek arch
+            #    olursa motor kullanıcıların yarısına HİÇ ulaşmaz.
+            rustup target add aarch64-apple-ios-macabi x86_64-apple-ios-macabi >/dev/null
+          fi
+
+          cargo test --manifest-path "$ENGINE/Cargo.toml" --workspace --no-fail-fast
+
+          # build-ios.sh'ı, Xcode'un vereceği env ile, gereken her platform
+          # için çağır. Xcode Run Script fazı biçimindeki script'ler (kanonik:
+          # PCAPviewerJargonix) bu değişkenleri okur; bağımsız script'ler
+          # (jpeg-repair) yok sayıp zaten hepsini üretir — ikisi de doğru.
+          run_slice() {
+            label="$1"; shift
+            echo "::group::build-ios.sh ($label)"
+            ( cd "$(dirname "$SCRIPT")" && env "$@" bash "./$(basename "$SCRIPT")" )
+            echo "::endgroup::"
+          }
+          run_slice device \
+            SDK_NAME=iphoneos PLATFORM_NAME=iphoneos EFFECTIVE_PLATFORM_NAME=-iphoneos ARCHS=arm64
+          run_slice simulator \
+            SDK_NAME=iphonesimulator PLATFORM_NAME=iphonesimulator EFFECTIVE_PLATFORM_NAME=-iphonesimulator "ARCHS=arm64 x86_64"
+          if [ "$NEEDS_CATALYST" = true ]; then
+            run_slice "mac catalyst" \
+              SDK_NAME=macosx PLATFORM_NAME=macosx EFFECTIVE_PLATFORM_NAME=-maccatalyst IS_MACCATALYST=YES "ARCHS=arm64 x86_64"
+          fi
+
+          # Ne üretildiğini SÖYLE. Eksik bir dilim aksi halde görünmez, ve
+          # görünmediği için aylarca fark edilmez.
+          echo "Static archives produced:"
+          CAT_OK=0
+          while IFS= read -r a; do
+            archs="$(lipo -archs "$a" 2>/dev/null | tr '\n' ' ')"
+            plats="$(otool -l "$a" 2>/dev/null | awk '/LC_BUILD_VERSION/{f=1} f&&/^ *platform/{print $2; f=0}' | sort -u | tr '\n' ' ')"
+            printf '  %-58s archs=%-16s platform=%s\n' "${a#./}" "$archs" "$plats"
+            case " $plats " in *" 6 "*)
+              case "$archs" in *arm64*) case "$archs" in *x86_64*) CAT_OK=1 ;; esac ;; esac ;;
+            esac
+          done < <(find "$ENGINE" -name '*.a' -not -path '*/deps/*' -not -path '*/build/*' | sort)
+
+          if [ "$NEEDS_CATALYST" = true ] && [ "$CAT_OK" -ne 1 ]; then
+            echo "::error::No Mac Catalyst archive carrying BOTH arm64 and x86_64 was produced (platform 6 = MACCATALYST). The Catalyst build would either fail to link or reach only half of Mac users."
+            exit 1
+          fi
+          echo "Native engine ready."
       
       - name: Sync
         working-directory: app
@@ -578,6 +678,19 @@ jobs:
           "
           
           if [ -f "Podfile" ]; then pod install; fi
+      
+      - name: Native Plugin
+        if: steps.features.outputs.has_native_rust == 'true' && steps.features.outputs.native_injector != ''
+        working-directory: app
+        env:
+          NATIVE_INJECTOR: ${{ steps.features.outputs.native_injector }}
+        run: |
+          set -euo pipefail
+          # `npx cap add ios` stok bir proje üretir; motoru ona bağlayan tek
+          # şey bu script (bridging header + LIBRARY_SEARCH_PATHS + -l...).
+          # `Ruby` adımı xcodeproj gem'ini kurdu, `iOS Target` pod install'u
+          # yaptı — enjektör bu ikisinden SONRA koşmalı.
+          ruby "$NATIVE_INJECTOR"
       
       - name: Catalyst
         if: inputs.target_platform == 'all_devices' || inputs.target_platform == 'macos_only'
