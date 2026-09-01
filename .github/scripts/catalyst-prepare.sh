@@ -10,8 +10,16 @@
 #      `ios-arm64_x86_64-simulator`), so the Catalyst link fails on correct code.
 #      The fix is to drop SPM and use the CocoaPods podspecs, which build from
 #      source and therefore have a Catalyst slice.
-#   3. RevenueCat calls `presentCodeRedemptionSheet()`, which is unavailable in
-#      Mac Catalyst and breaks the compile.
+#   3. RevenueCat calls `presentCodeRedemptionSheet()`, which breaks the compile.
+#      ⛔ AND THE REASON IS NOT THE ONE EVERYONE ASSUMES. Apple's own header on
+#      this SDK is `API_UNAVAILABLE(tvos, macos, watchos)` — macCatalyst is NOT
+#      in that list, so StoreKit's method IS available on Catalyst and a
+#      typecheck of it passes. The blocker is RevenueCat's OWN wrapper:
+#        PurchasesHybridCommon.CommonFunctionality.presentCodeRedemptionSheet:7
+#        note: 'presentCodeRedemptionSheet()' has been explicitly marked unavailable here
+#      MEASURED both ways on Xcode 26.6: patched -> BUILD SUCCEEDED, unpatched ->
+#      exit 65. Anyone who checks Apple's header, concludes the patch is
+#      unnecessary and drops it will ship a build that cannot compile for Mac.
 #
 # This does the same three things the publish workflows do, to a TEMPORARY
 # checkout. It never runs against a developer's tree.
