@@ -1,0 +1,309 @@
+# ─── verify-catalyst — run a private repo's Mac Catalyst proofs on a real Mac ──
+#
+# WHY IT EXISTS. `verify.yml` runs a project's npm scripts and `verify-native.yml`
+# runs its cargo suite. Between them they cover everything in these projects
+# EXCEPT the two things that only ever break on a Mac: `swiftc` and `xcodebuild`.
+# Neither of the other two workflows invokes either, by design and by their own
+# documentation.
+#
+# ⛔ AND THAT GAP IS WHERE THE FIELD REPORTS COME FROM. Mac is a first-class
+# surface for this portfolio, but a Capacitor project does not even BUILD for
+# Mac Catalyst as checked in: `SUPPORTS_MACCATALYST` is not in the pbxproj, the
+# publish workflows inject it, and Capacitor 8's SPM artifacts carry no
+# maccatalyst slice at all (measured: Capacitor.xcframework and
+# Cordova.xcframework ship only `ios-arm64` and `ios-arm64_x86_64-simulator`).
+# So `xcodebuild` against a fresh clone does not test Mac — it silently tests
+# something else — and a Catalyst regression can only surface in front of a user.
+#
+# ⛔ WHAT THIS RUNS. The project's OWN Catalyst probes, whatever they are, named
+# by input. It invents no test. Where a project has none, this says so and fails
+# rather than reporting a green tick for an empty run.
+#
+# ⛔ BOTH ARCHITECTURES, AND THAT IS THE POINT. A macabi binary only executes on
+# a Mac of its own architecture: `aarch64-apple-ios-macabi` cannot run on an
+# Intel machine and `x86_64-apple-ios-macabi` cannot run natively on Apple
+# Silicon. A developer on one architecture can never honestly verify the other,
+# and the app ships BOTH slices to users. `macabi_targets` runs each in turn and
+# reports them separately; a slice that cannot execute is a FAILURE naming the
+# runner it needed, never a quiet pass.
+#
+# ⛔ THE PROBE MUST PROVE IT IS A PROBE. A Swift file compiled for the host and
+# one compiled for Mac Catalyst look identical and behave differently — the whole
+# class of bug this exists to catch. The project's probe script is expected to
+# assert its own binary's MACCATALYST load command; this workflow additionally
+# prints what the runner actually was, because "x86_64-macabi green" means
+# something different on Intel than on Rosetta.
+#
+# ⛔ NO SILENT SKIPS. A missing probe script, a missing parity gate, a target
+# that could not execute: each is a failure that names what is missing.
+#
+# ⛔ SAME PRIVACY CONTRACT AS verify.yml AND verify-native.yml, for the same
+# reasons. The repo name is read from the event payload and `::add-mask::`ed
+# before anything can echo it; no step prints project output; a failing step
+# prints a bounded, path-scrubbed tail; captured output is shredded at the end.
+# Nothing here talks to Apple — no signing, no App Store Connect, no fastlane,
+# no network call to apple.com. The only secrets read are GH_PAT and
+# VERIFY_TARGETS, and VERIFY_TARGETS' npm field is ignored here.
+#
+# ADDITIVE BY CONSTRUCTION. Reads, imports and modifies no other workflow.
+
+name: verify-catalyst
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: 'VERIFY_TARGETS alias (preferred — leaks nothing), or a literal owner/repo'
+        required: true
+        type: string
+
+      branch:
+        description: 'Branch, when the alias line does not pin one'
+        required: false
+        type: string
+        default: 'main'
+
+      runner:
+        description: 'Runner label. A macabi slice only runs on its own architecture.'
+        required: false
+        type: choice
+        options: ['macos-15', 'macos-14', 'macos-latest', 'macos-15-intel', 'macos-13']
+        default: 'macos-15'
+
+      parity_script:
+        description: 'Gate asserting the probes still mirror the shipped source (empty = skip, and say so)'
+        required: false
+        type: string
+        default: 'ios/harness/check-parity.sh'
+
+      probes_script:
+        description: 'The project''s Catalyst probe runner. Receives MACABI_TARGET.'
+        required: false
+        type: string
+        default: 'ios/harness/run-catalyst-probes.sh'
+
+      macabi_targets:
+        description: 'Space-separated macabi triples to run the probes for'
+        required: false
+        type: string
+        default: 'x86_64-apple-ios15.0-macabi arm64-apple-ios15.0-macabi'
+
+      xcodebuild:
+        description: 'Also build the whole app for Mac Catalyst (slow; needs the SPM→CocoaPods conversion)'
+        required: false
+        type: boolean
+        default: false
+
+      failure_tail:
+        description: 'Lines of a failing step to print (0 = none)'
+        required: false
+        type: string
+        default: '60'
+
+permissions:
+  contents: read
+
+jobs:
+  verify-catalyst:
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 60
+
+    steps:
+      # ⛔ Read from the event payload and mask BEFORE any step can echo it.
+      - name: Resolve target
+        id: target
+        env:
+          TARGETS: ${{ secrets.VERIFY_TARGETS }}
+          FALLBACK_BRANCH: ${{ inputs.branch }}
+        run: |
+          set -euo pipefail
+          ALIAS="$(jq -r '.inputs.target // ""' "$GITHUB_EVENT_PATH")"
+          [[ -n "$ALIAS" ]] || { echo "::error::no target given"; exit 1; }
+
+          repo=""; branch=""; how=""
+          if [[ -n "${TARGETS:-}" ]]; then
+            line="$(printf '%s\n' "$TARGETS" | sed 's/#.*//' | awk -F'|' -v a="$ALIAS" '
+              { k = $1; gsub(/^[ \t]+|[ \t]+$/, "", k) }
+              k == a { print; found = 1; exit }
+              END { if (!found) exit 1 }
+            ')" || line=""
+            if [[ -n "$line" ]]; then
+              field() { printf '%s\n' "$line" | cut -s -d'|' -f"$1" | sed 's/^[ \t]*//; s/[ \t]*$//'; }
+              repo="$(field 2)"; branch="$(field 3)"
+              how="alias"
+            fi
+          fi
+          if [[ -z "$repo" && "$ALIAS" == */* ]]; then
+            repo="$ALIAS"
+            how="literal (name is in this run's inputs, which log deletion does NOT remove; delete the RUN)"
+          fi
+          [[ -n "$repo" ]] || { echo "::error::target is neither a VERIFY_TARGETS alias nor an owner/repo"; exit 1; }
+          [[ "$repo" == */* && "$repo" != */*/* ]] || { echo "::error::target did not resolve to owner/repo"; exit 1; }
+          [[ -n "$branch" ]] || branch="${FALLBACK_BRANCH:-main}"
+
+          echo "::add-mask::$repo"
+          echo "::add-mask::${repo%%/*}"
+          echo "::add-mask::${repo##*/}"
+          { echo "repo=$repo"; echo "branch=$branch"; } >> "$GITHUB_OUTPUT"
+          echo "target resolved via $how (masked); branch: $branch"
+
+      # This repo, for scripts/catalyst-prepare.sh. Public; nothing to mask.
+      - name: Check out this repo
+        uses: actions/checkout@v4
+        with:
+          path: dumlutest
+
+      - name: Check out the project
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ steps.target.outputs.repo }}
+          ref: ${{ steps.target.outputs.branch }}
+          token: ${{ secrets.GH_PAT }}
+          path: app
+
+      # ⛔ The architecture is part of the verdict. "arm64-macabi green" on an
+      # Intel runner would mean the slice never executed at all.
+      - name: Record what is under test
+        id: env
+        working-directory: app
+        run: |
+          set -euo pipefail
+          echo "commit under test: $(git rev-parse HEAD)"
+          ARCH="$(uname -m)"
+          echo "runner label: ${{ inputs.runner }}"
+          echo "runner arch:  $ARCH"
+          echo "macOS:        $(sw_vers -productVersion 2>/dev/null || echo '?')"
+          echo "xcode:        $(xcodebuild -version 2>/dev/null | head -1 || echo unknown)"
+          echo "sdk:          $(xcrun --sdk macosx --show-sdk-path 2>/dev/null || echo unknown)"
+          echo "arch=$ARCH" >> "$GITHUB_OUTPUT"
+
+      # ⛔ A probe that has drifted from the code it claims to mirror keeps
+      # reporting PASS while testing nothing, which is worse than no probe.
+      - name: Parity gate
+        working-directory: app
+        run: |
+          set -uo pipefail
+          set +e
+          SCRIPT="${{ inputs.parity_script }}"
+          if [[ -z "$SCRIPT" ]]; then
+            echo "::warning::no parity gate given — the probes' fidelity to the shipped source is UNVERIFIED in this run"
+            exit 0
+          fi
+          if [[ ! -f "$SCRIPT" ]]; then
+            echo "::error::parity gate not found at $SCRIPT — not a skip: this run cannot say the probes still mirror the source"
+            exit 1
+          fi
+          chmod +x "$SCRIPT"
+          "./$SCRIPT"
+
+      - name: Run the Catalyst probes, per architecture
+        working-directory: app
+        env:
+          TAIL: ${{ inputs.failure_tail }}
+          MEASURED_ARCH: ${{ steps.env.outputs.arch }}
+        run: |
+          set -uo pipefail
+          set +e
+          SCRIPT="${{ inputs.probes_script }}"
+          if [[ ! -f "$SCRIPT" ]]; then
+            echo "::error::no Catalyst probes at $SCRIPT — this project declares no Mac Catalyst proof, and a green tick here would be a lie"
+            exit 1
+          fi
+          chmod +x "$SCRIPT"
+          mkdir -p "$RUNNER_TEMP/out"
+          # Paths and the project name never reach the log.
+          scrub() { sed -e "s@$GITHUB_WORKSPACE@<workspace>@g" -e "s@$RUNNER_TEMP@<temp>@g" -e "s@/Users/runner@~@g"; }
+
+          PASS=(); FAIL=()
+          for t in ${{ inputs.macabi_targets }}; do
+            log="$RUNNER_TEMP/out/${t}.log"
+            started=$SECONDS
+            MACABI_TARGET="$t" "./$SCRIPT" >"$log" 2>&1
+            rc=$?
+            # A slice that cannot execute here was NOT verified. Say which runner it needed.
+            if grep -qE 'Bad CPU type|cannot execute binary|Exec format error' "$log"; then
+              rc=1
+              want='an Apple Silicon runner (macos-15)'
+              [[ "$t" == x86_64* ]] && want='an Intel runner (macos-15-intel)'
+              echo "::error::$t could not execute on a ${MEASURED_ARCH} runner — dispatch with $want"
+            fi
+            # The probe script is expected to prove its own binary is MACCATALYST.
+            if ! grep -q 'MACCATALYST' "$log"; then
+              rc=1
+              echo "::error::$t produced no MACCATALYST confirmation — a probe built for the host proves nothing about Catalyst"
+            fi
+            if [[ $rc -eq 0 ]]; then
+              PASS+=("$t"); printf '  PASS  %-34s %ss\n' "$t" "$((SECONDS - started))"
+            else
+              FAIL+=("$t"); printf '  FAIL  %-34s %ss\n' "$t" "$((SECONDS - started))"
+              if [[ "${TAIL:-0}" -gt 0 ]]; then
+                echo "  ---- last $TAIL lines of $t ----"
+                tail -n "$TAIL" "$log" | scrub | sed 's/^/  | /'
+                echo "  ---- end $t ----"
+              fi
+            fi
+          done
+          echo
+          echo "probes: ${#PASS[@]} passed, ${#FAIL[@]} failed  (runner arch ${MEASURED_ARCH})"
+          [[ ${#FAIL[@]} -eq 0 ]]
+
+      # ⛔ The build is OFF by default because it is slow and because the probes
+      # are the part that catches behaviour. But "it compiles for Catalyst" is
+      # its own claim, and a fresh clone does NOT compile for Catalyst: three
+      # things have to be done to it first, exactly as the publish workflows do.
+      # ⛔ The build is OFF by default because it is slow, and because the probes
+      # are the part that catches BEHAVIOUR. But "it still compiles for Catalyst"
+      # is its own claim worth holding, and a fresh clone does NOT compile for
+      # Catalyst — see scripts/catalyst-prepare.sh for the three reasons.
+      - name: Build the app for Mac Catalyst
+        if: inputs.xcodebuild
+        env:
+          TAIL: ${{ inputs.failure_tail }}
+        run: |
+          set -uo pipefail
+          set +e
+          scrub() { sed -e "s@$GITHUB_WORKSPACE@<workspace>@g" -e "s@/Users/runner@~@g"; }
+          mkdir -p "$RUNNER_TEMP/out"
+          log="$RUNNER_TEMP/out/xcodebuild.log"
+          {
+            bash "$GITHUB_WORKSPACE/dumlutest/.github/scripts/catalyst-prepare.sh" "$GITHUB_WORKSPACE/app" &&
+            xcodebuild -workspace "$GITHUB_WORKSPACE/app/ios/App/App.xcworkspace" \
+              -scheme App -configuration Debug \
+              -destination 'platform=macOS,variant=Mac Catalyst' \
+              -derivedDataPath "$RUNNER_TEMP/catbuild" \
+              CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO CODE_SIGNING_ALLOWED=NO build
+          } >"$log" 2>&1
+          rc=$?
+
+          # ⛔ BUILD SUCCEEDED is not the claim being made. "The product is a Mac
+          # Catalyst binary" is — and those are not the same sentence.
+          APP="$RUNNER_TEMP/catbuild/Build/Products/Debug-maccatalyst/App.app"
+          if [[ $rc -eq 0 && -d "$APP" ]]; then
+            plat="$(vtool -show-build "$APP/Contents/MacOS/App" 2>/dev/null | awk '/platform/{print $2}')"
+            arch="$(lipo -info "$APP/Contents/MacOS/App" 2>/dev/null | sed 's/.*: //')"
+            echo "  product platform: ${plat:-unknown}   arch: ${arch:-unknown}"
+            if [[ "$plat" != "MACCATALYST" ]]; then
+              echo "::error::built product is ${plat:-unknown}, not MACCATALYST"
+              rc=1
+            fi
+          else
+            rc=1
+          fi
+
+          if [[ $rc -ne 0 ]]; then
+            echo "  FAIL  Mac Catalyst build"
+            if [[ "${TAIL:-0}" -gt 0 ]]; then
+              echo "  ---- last $TAIL lines ----"
+              tail -n "$TAIL" "$log" | scrub | sed 's/^/  | /'
+              echo "  ---- end ----"
+            fi
+          else
+            echo "  PASS  Mac Catalyst build"
+          fi
+          exit $rc
+
+      # ⛔ Never `if: success()` — output must be shredded on failure too, which
+      # is precisely when it exists.
+      - name: Shred captured output
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/out" "$RUNNER_TEMP/catbuild" || true
