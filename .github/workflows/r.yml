@@ -314,6 +314,81 @@ jobs:
         working-directory: app
         run: ${{ inputs.npm_build_command }}
       
+      - name: Web Bundle Guard
+        working-directory: app
+        run: |
+          # Does the build the runner just made actually contain what the app
+          # loads at runtime? Two questions, both of which shipped as "no" and
+          # neither of which any test in any app repo was asking.
+          #
+          # ⛔ WHY THIS EXISTS. GPXview 1.0.20 shipped a web worker that had
+          # never been compiled: a commit lifted `new URL(...)` out of the
+          # `new Worker(...)` call, Vite's worker plugin stopped matching that
+          # expression, and the ASSET pipeline took the file instead — copying
+          # `src/workers/gpx.worker.ts` into the build VERBATIM as
+          # `assets/gpx.worker-<hash>.ts`. Capacitor serves `.ts` as
+          # application/octet-stream (UTType maps it to mpeg-2-transport-stream,
+          # which has no MIME type), so WebKit 14+ refuses the module worker and
+          # reports a bare `error` event with no message, while WebKit 12/13
+          # runs it as JavaScript and dies on the first type alias. Nineteen
+          # field reports; not one file could be opened in that release.
+          #
+          # The source was never wrong. It type-checked, it linted, and the app
+          # repo's 738 unit tests were green — because nothing looked at what
+          # `vite build` emitted. That is precisely why the check belongs HERE,
+          # on the runner that produces the archive, and not in a test suite
+          # this workflow does not run.
+          set -euo pipefail
+          WEB_DIR="${{ steps.capacitor.outputs.web_dir }}"
+          OUT=""
+          for d in "dist" "$WEB_DIR" "build" "www"; do
+            [ -n "$d" ] && [ -d "$d" ] && { OUT="$d"; break; }
+          done
+          if [ -z "$OUT" ]; then
+            echo "::warning::no web output directory found after the build step; skipping the bundle guard"
+            exit 0
+          fi
+          echo "Checking web bundle in: $OUT"
+          FAIL=0
+
+          # 1 — Raw TypeScript in the shipped bundle. There is no build in which
+          #     this is correct: a `.ts`/`.tsx` file under the output directory
+          #     means a module the bundler declined to compile and copied as a
+          #     static asset, and the WebView cannot execute it.
+          LEAKED=$(find "$OUT" -type f \( -name '*.ts' -o -name '*.tsx' \) -not -name '*.d.ts' 2>/dev/null || true)
+          if [ -n "$LEAKED" ]; then
+            echo "::error::The build copied TypeScript source into the shipped bundle instead of compiling it. The WebView cannot run these files — Capacitor serves .ts as application/octet-stream, so a module worker refuses to start and reports a bare error event with no message. This is the GPXview 1.0.20 failure. Files:"
+            echo "$LEAKED"
+            echo "Cause to look for: a \`new Worker(...)\` whose first argument is NOT the literal expression \`new URL(\"...\", import.meta.url)\` written inside the call. Fix: import the worker as \`?worker&url\` and pass that."
+            FAIL=1
+          fi
+
+          # 2 — A wasm engine that exists in src/ but never reached the bundle.
+          #     wasm-pack output is only pulled in through whatever imports its
+          #     glue; when that importer is a worker the bundler skipped, the
+          #     ENGINE silently leaves the build with it. GPXview 1.0.20 shipped
+          #     with no .wasm at all and the log said nothing.
+          #     Opt out with a `.no-web-wasm` file in the app repo root, for an
+          #     engine that is deliberately fetched at runtime rather than
+          #     bundled. Same spirit as MAC-STRIPPED-OK below: an app that means
+          #     it says so, and every other app stays guarded.
+          SRC_WASM=$(find src -type f -name '*.wasm' 2>/dev/null | head -1 || true)
+          if [ -n "$SRC_WASM" ] && [ ! -f ".no-web-wasm" ]; then
+            OUT_WASM=$(find "$OUT" -type f -name '*.wasm' 2>/dev/null | head -1 || true)
+            if [ -z "$OUT_WASM" ]; then
+              echo "::error::src/ carries a WebAssembly engine ($SRC_WASM) but the build emitted no .wasm into $OUT — the engine is NOT in this archive and every operation that needs it will fail on the user's device. Usual cause: the only module that imports the wasm glue is a worker the bundler did not compile (see the TypeScript check above). If this app fetches its engine at runtime on purpose, add an empty .no-web-wasm file to the repo root."
+              FAIL=1
+            else
+              echo "wasm engine present in bundle: $OUT_WASM"
+            fi
+          fi
+
+          if [ "$FAIL" = "1" ]; then
+            echo "This archive would not work on a user's device. Not uploading it."
+            exit 1
+          fi
+          echo "Web bundle guard passed."
+      
       - name: Native Engine
         if: steps.features.outputs.has_native_rust == 'true'
         working-directory: app
