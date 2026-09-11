@@ -32,8 +32,13 @@ final class VerifyUITests: XCTestCase {
         passOnboarding(app, home: home)
         openFile(app, home: home, name: file)
 
-        let exportButton = app.buttons[exportSteps.first ?? ""].firstMatch
-        let closeViewer = app.buttons[viewerLabel].firstMatch
+        // Not app.buttons[label]: that is an EXACT match on a BUTTON, and these controls are often
+        // icon buttons whose only text is a title attribute, or tappable non-buttons inside a web
+        // view. Measured on stlviewer: nothing in the accessibility tree was labelled "Export" at
+        // all, and the same shape is what this app fails on. element() matches a label prefix and
+        // falls through to any descendant.
+        let exportButton = element(app, exportSteps.first ?? "")
+        let closeViewer = element(app, viewerLabel)
         XCTAssertTrue(closeViewer.waitForExistence(timeout: 240), "the native 3D viewer is presented")
         XCTAssertTrue(exportButton.waitForExistence(timeout: 30), "the viewer's Export button")
         sleep(6)
@@ -167,7 +172,7 @@ final class VerifyUITests: XCTestCase {
     /// runner environment; none of the app's words live in this file.
     private func reachSheet(_ app: XCUIApplication, _ steps: [String]) -> Bool {
         for (i, label) in steps.enumerated() {
-            guard tapIfExists(app.buttons[label].firstMatch, i == 0 ? 30 : 15) else {
+            guard tapIfExists(element(app, label), i == 0 ? 30 : 15) else {
                 snap(app, "no-export-step-\(i)")
                 return false
             }
