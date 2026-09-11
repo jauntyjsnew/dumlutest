@@ -91,6 +91,12 @@ case "$KIND" in
     run npm ci --legacy-peer-deps || { rm -f package-lock.json; run npm install --legacy-peer-deps || die "npm install"; }
     run npm run build || die "web build"
     run npx cap sync ios || die "cap sync"
+    # A Capacitor project builds through CocoaPods: without `pod install` the Xcode project points at
+    # an xcconfig that does not exist yet and the build dies on "Unable to open base configuration".
+    if [ -f ios/App/Podfile ]; then
+      command -v pod >/dev/null || run gem install --no-document cocoapods || die "cocoapods install"
+      ( cd ios/App && run pod install ) || die "pod install"
+    fi
     PROJ=ios/App/App.xcodeproj; TESTS_DIR=VerifyUITests; APP_TARGET=App
     cd ios/App || die "ios dir" ;;
 esac
