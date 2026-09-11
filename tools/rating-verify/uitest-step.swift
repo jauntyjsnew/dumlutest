@@ -94,7 +94,16 @@ final class VerifyUITests: XCTestCase {
 
     /// Picks the fixture (copied into the fresh install's Documents, where the picker opens).
     private func openFile(_ app: XCUIApplication, home: String, name: String) {
-        XCTAssertTrue(tapIfExists(element(app, home), 20), "open-file control (\(home))")
+        // The configured words first; if they are not on this screen, fall back to the biggest
+        // tappable thing rather than failing the whole run on one label that may have changed.
+        var opener = element(app, home)
+        if !(opener.waitForExistence(timeout: 20) && opener.isHittable), let big = openCandidates(app).first {
+            let f = big.frame
+            print("VERIFY-STATE fallback=largest-card at (\(Int(f.minX)),\(Int(f.minY))) "
+                  + "size \(Int(f.width))x\(Int(f.height))")
+            opener = big
+        }
+        XCTAssertTrue(tapIfExists(opener, 20), "open-file control (\(home))")
         let byName = NSPredicate(format: "label BEGINSWITH %@", name)
         let cell = app.cells.matching(byName).firstMatch
         let text = app.staticTexts.matching(byName).firstMatch
@@ -175,6 +184,23 @@ final class VerifyUITests: XCTestCase {
     }
 
     // MARK: - Queries
+
+    /// Things that could be the open-file control, biggest first — the same search the generic driver
+    /// had to grow: the control can sit at the BOTTOM of the screen, it can be small, and it is not
+    /// always a button (a tappable card in a web view can report as plain text).
+    private func openCandidates(_ app: XCUIApplication) -> [XCUIElement] {
+        let tabBarTop = app.tabBars.firstMatch.exists ? app.tabBars.firstMatch.frame.minY : .greatestFiniteMagnitude
+        func usable(_ e: XCUIElement) -> Bool {
+            guard e.exists, e.isHittable else { return false }
+            let f = e.frame
+            return f.width * f.height > 1200 && f.midY < tabBarTop
+        }
+        let area: (XCUIElement) -> CGFloat = { $0.frame.width * $0.frame.height }
+        let buttons = app.buttons.allElementsBoundByIndex.filter(usable).sorted { area($0) > area($1) }
+        let others = (app.otherElements.allElementsBoundByIndex + app.staticTexts.allElementsBoundByIndex)
+            .filter(usable).sorted { area($0) > area($1) }
+        return buttons + others
+    }
 
     private func element(_ app: XCUIApplication, _ label: String) -> XCUIElement {
         let predicate = NSPredicate(format: "label BEGINSWITH %@", label)
