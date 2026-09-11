@@ -81,7 +81,9 @@ jobs:
           i=0
           while IFS= read -r field; do
             i=$((i+1))
-            [ -n "$field" ] && [ "$i" -gt 1 ] && echo "::add-mask::$field"
+            # Mask what identifies the app. Never a number or a two-letter word: GitHub would then
+            # replace every occurrence of it in the log and the report would be unreadable.
+            [ "${#field}" -ge 5 ] && [ "$i" -gt 1 ] && echo "::add-mask::$field"
             case $i in
               2) echo "repo=$field" >> "$GITHUB_OUTPUT" ;;
               3) echo "branch=$field" >> "$GITHUB_OUTPUT" ;;
