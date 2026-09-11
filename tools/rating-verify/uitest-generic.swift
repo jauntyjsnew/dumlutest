@@ -110,7 +110,21 @@ final class VerifyUITests: XCTestCase {
             print("VERIFY-STATE home=\(target.exists ? "present-not-hittable" : "absent") "
                   + "onboardingButtonVisible=\(onboardingLeft) buttons=\(app.buttons.count) staticTexts=\(app.staticTexts.count)")
         }
-        XCTAssertTrue(tapIfExists(target, 5), "open-file control (\(home))")
+        var opener = target
+        if !(target.exists && target.isHittable) {
+            // The configured words are not on this screen (a different layout, or wording this run
+            // does not know). These apps all put file opening in one big card near the top, so fall
+            // back to the largest tappable area in the top two thirds rather than guessing wording.
+            let cards = app.buttons.allElementsBoundByIndex.filter {
+                $0.exists && $0.isHittable && $0.frame.midY < app.frame.height * 0.75
+            }
+            if let big = cards.max(by: { $0.frame.width * $0.frame.height < $1.frame.width * $1.frame.height }),
+               big.frame.width * big.frame.height > 5000 {
+                print("VERIFY-STATE fallback=largest-card area=\(Int(big.frame.width * big.frame.height))")
+                opener = big
+            }
+        }
+        XCTAssertTrue(tapIfExists(opener, 5), "open-file control (\(home))")
         let byName = NSPredicate(format: "label BEGINSWITH %@", name)
         let cell = app.cells.matching(byName).firstMatch
         let text = app.staticTexts.matching(byName).firstMatch
