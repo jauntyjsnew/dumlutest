@@ -170,6 +170,13 @@ final class VerifyUITests: XCTestCase {
             let browseTab = app.tabBars.buttons["Browse"].firstMatch
             if browseTab.exists && browseTab.isHittable { browseTab.tap() }
         }
+        if !picked {
+            // Counts and yes/no only — enough to tell "the picker never opened" from "it opened
+            // somewhere else" or "the file is not listed", without printing anything the app owns.
+            print("VERIFY-STATE picker tabs=\(pickerTabs.exists) fixtureCell=\(cell.exists) fixtureText=\(text.exists) "
+                  + "onMyIPhoneTitle=\(app.navigationBars.staticTexts["On My iPhone"].exists) "
+                  + "browseTab=\(app.tabBars.buttons["Browse"].exists) cells=\(app.cells.count) buttons=\(app.buttons.count)")
+        }
         XCTAssertTrue(picked, "fixture \(name) found in Files › On My iPhone")
         // No trailing "Open" tap: the picker's own Open was handled inside the loop, and after the
         // picker is gone an "Open" button is the app's (fb2-to-pdf's Open tab leaves the book).
@@ -210,11 +217,16 @@ final class VerifyUITests: XCTestCase {
         return copyAction(app).waitForExistence(timeout: 180)
     }
 
+    /// Dismiss the share sheet without sharing. On a tall phone the "Close" button can be tapped and
+    /// the sheet still stay up, so try each way in turn and check after every attempt.
     private func closeSheet(_ app: XCUIApplication) {
-        if !tapIfExists(app.buttons["Close"].firstMatch, 6) {
-            app.swipeDown()
-        }
-        waitGone(copyAction(app), 30)
+        let copy = copyAction(app)
+        _ = tapIfExists(app.buttons["Close"].firstMatch, 6)
+        if copy.exists { sleep(2); app.swipeDown() }
+        if copy.exists { sleep(2); app.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.06)).tap() }
+        if copy.exists { sleep(2); _ = tapIfExists(app.buttons["Cancel"].firstMatch, 3) }
+        if copy.exists { print("VERIFY-STATE sheet did not close after Close, swipe, tap-above and Cancel") }
+        waitGone(copy, 30)
     }
 
     // MARK: - Queries
