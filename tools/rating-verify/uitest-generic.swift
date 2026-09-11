@@ -101,7 +101,16 @@ final class VerifyUITests: XCTestCase {
     /// app's own (empty) folder, so walk up with the "On My iPhone" back button, or go through
     /// Browse › On My iPhone, until the fixture shows.
     private func openFile(_ app: XCUIApplication, home: String, name: String) {
-        XCTAssertTrue(tapIfExists(element(app, home), 20), "open-file control (\(home))")
+        let target = element(app, home)
+        if !(target.waitForExistence(timeout: 20) && target.isHittable) {
+            // Say what the screen was, without printing any of the app's own words: is the home
+            // control there at all, and is an onboarding button still waiting to be tapped?
+            let labels = (env["V_ONBOARD"] ?? "Skip,Get Started,Next,Continue").split(separator: ",").map(String.init)
+            let onboardingLeft = labels.contains { app.buttons.matching(NSPredicate(format: "label BEGINSWITH[c] %@", $0)).firstMatch.exists }
+            print("VERIFY-STATE home=\(target.exists ? "present-not-hittable" : "absent") "
+                  + "onboardingButtonVisible=\(onboardingLeft) buttons=\(app.buttons.count) staticTexts=\(app.staticTexts.count)")
+        }
+        XCTAssertTrue(tapIfExists(target, 5), "open-file control (\(home))")
         let byName = NSPredicate(format: "label BEGINSWITH %@", name)
         let cell = app.cells.matching(byName).firstMatch
         let text = app.staticTexts.matching(byName).firstMatch
