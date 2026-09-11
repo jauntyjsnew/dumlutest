@@ -53,7 +53,16 @@ final class VerifyUITests: XCTestCase {
         snap(app, "opened")
 
         if env["V_CANCEL"] != "0" {
-            XCTAssertTrue(reachSheet(app, steps), "export sheet, cancel round")
+            // The very first export can come too early: an app still drawing what it just opened has
+            // not put its export control on screen yet, so the optional first step gets skipped and
+            // nothing starts. One retry after a pause — the later rounds already prove the app works.
+            var reached = reachSheet(app, steps)
+            if !reached {
+                print("VERIFY-STATE first export round found no sheet; waiting and trying once more")
+                sleep(20)
+                reached = reachSheet(app, steps)
+            }
+            XCTAssertTrue(reached, "export sheet, cancel round")
             sleep(4)
             snap(app, "sheet-cancel")
             closeSheet(app)
