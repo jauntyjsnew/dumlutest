@@ -104,20 +104,36 @@ final class VerifyUITests: XCTestCase {
         var tappedFixture = false
         for attempt in 0..<10 {
             sleep(3)
-            // "Picker gone" means "picked" only after the fixture was tapped.
-            if tappedFixture && !pickerTabs.exists && !cell.exists { picked = true; break }
-            if cell.exists || (text.exists && pickerTabs.exists) {
-                if cell.exists {
-                    cell.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.25)).tap()
-                } else {
+            // Same rules the generic driver had to learn, ported here: "the picker is gone" must be
+            // judged by the picker's OWN furniture — its tabs and its title — because the app lists
+            // the file it just opened as a row of its own, so that row never disappears.
+            let pickerUp = pickerTabs.exists || app.navigationBars.staticTexts["On My iPhone"].exists
+            if !pickerUp && (tappedFixture || text.exists) { picked = true; break }
+            // Only tap what is still on screen: a row that vanished between the poll and the tap makes
+            // XCUITest fail on the coordinate itself, which reads like a test error.
+            if (cell.exists && cell.isHittable) || (text.exists && pickerTabs.exists) {
+                // One gesture does not open the file in every picker: a list row opens on a single
+                // tap, a grid tile only selects and needs Open, and some want the thumbnail rather
+                // than the row's middle. Escalate across attempts instead of repeating one tap.
+                if cell.exists && cell.isHittable {
+                    let spot = cell.coordinate(withNormalizedOffset:
+                        CGVector(dx: 0.5, dy: attempt % 3 == 1 ? 0.5 : 0.25))
+                    if attempt % 3 == 2 { spot.doubleTap() } else { spot.tap() }
+                } else if text.exists {
                     text.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: -1.5)).tap()
                 }
                 tappedFixture = true
                 sleep(3)
-                // Only the PICKER's Open (its navigation bar, while it is up), never an app tab.
-                let pickerOpen = app.navigationBars.buttons["Open"].firstMatch
-                if pickerTabs.exists && pickerOpen.exists && pickerOpen.isEnabled { pickerOpen.tap(); sleep(3) }
-                if !pickerTabs.exists && !cell.exists { picked = true; break }
+                // The picker's own Open — navigation bar OR toolbar; in grid mode a tap only selects.
+                // Never a TAB bar button: an app can have an "Open" tab and tapping it leaves the file.
+                for bar in [app.navigationBars, app.toolbars] {
+                    let open = bar.buttons["Open"].firstMatch
+                    if pickerTabs.exists && open.exists && open.isEnabled { open.tap(); sleep(3); break }
+                }
+                if !pickerTabs.exists && !app.navigationBars.staticTexts["On My iPhone"].exists {
+                    picked = true
+                    break
+                }
                 snap(app, "picker-tapped-\(attempt)")
                 continue
             }
@@ -196,7 +212,19 @@ final class VerifyUITests: XCTestCase {
     @discardableResult
     private func tapIfExists(_ element: XCUIElement, _ timeout: TimeInterval) -> Bool {
         guard element.waitForExistence(timeout: timeout) else { return false }
-        element.tap()
+        // Same lesson the generic driver paid for: a card can be on screen and enabled yet report
+        // "not hittable" (a web view answers hit testing for its own content). `tap()` then fails the
+        // whole test — with XCUITest quoting the app's label into a public log — and tapping the
+        // element's own coordinate space does not reach the page either. A tap on the APPLICATION at
+        // that absolute point is a real screen touch, and the web view gets it.
+        if element.isHittable {
+            element.tap()
+        } else {
+            let f = element.frame
+            XCUIApplication().coordinate(withNormalizedOffset: .zero)
+                .withOffset(CGVector(dx: f.midX, dy: f.midY))
+                .tap()
+        }
         return true
     }
 
