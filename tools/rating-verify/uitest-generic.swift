@@ -157,6 +157,19 @@ final class VerifyUITests: XCTestCase {
                 continue
             }
             snap(app, "picker-\(attempt)")
+            // No picker at all: the first tap landed on text inside the open-file card instead of the
+            // card. Tap the biggest tappable area in the top two thirds once, then keep looking.
+            if attempt == 1 && !pickerTabs.exists {
+                let cards = app.buttons.allElementsBoundByIndex.filter {
+                    $0.exists && $0.isHittable && $0.frame.midY < app.frame.height * 0.75
+                }
+                if let big = cards.max(by: { $0.frame.width * $0.frame.height < $1.frame.width * $1.frame.height }),
+                   big.frame.width * big.frame.height > 5000 {
+                    print("VERIFY-STATE no picker yet; tapping largest card area=\(Int(big.frame.width * big.frame.height))")
+                    big.tap()
+                    continue
+                }
+            }
             // Already inside On My iPhone: the fixture is further down the grid, so scroll.
             if app.navigationBars.staticTexts["On My iPhone"].exists {
                 let files = app.collectionViews["File View"].firstMatch
@@ -222,6 +235,13 @@ final class VerifyUITests: XCTestCase {
     private func closeSheet(_ app: XCUIApplication) {
         let copy = copyAction(app)
         _ = tapIfExists(app.buttons["Close"].firstMatch, 6)
+        // A real drag on the sheet itself, from its own content down off the screen: a plain
+        // swipeDown on the application scrolls the page behind the sheet instead of dismissing it.
+        if copy.exists {
+            sleep(2)
+            copy.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0))
+                .press(forDuration: 0.1, thenDragTo: app.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 1.0)))
+        }
         if copy.exists { sleep(2); app.swipeDown() }
         if copy.exists { sleep(2); app.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.06)).tap() }
         if copy.exists { sleep(2); _ = tapIfExists(app.buttons["Cancel"].firstMatch, 3) }
