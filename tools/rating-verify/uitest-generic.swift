@@ -472,9 +472,23 @@ final class VerifyUITests: XCTestCase {
         // gets it.
         if element.isHittable {
             element.tap()
+            return true
+        }
+        // Measured on GPXview: the open card is enabled, reports hittable=false, and neither its own
+        // coordinate space nor an absolute tap on the application opens anything — nine attempts, no
+        // change. The card lives in a web view, and the tap that a person's finger delivers goes
+        // through the WEB VIEW's hit testing. So map the card's centre into the web view's own
+        // normalised space and tap there; fall back to the absolute point when there is no web view.
+        let f = element.frame
+        let app = XCUIApplication()
+        let web = app.webViews.firstMatch
+        let webFrame = web.exists ? web.frame : .zero
+        if webFrame.width > 0, webFrame.height > 0, webFrame.contains(CGPoint(x: f.midX, y: f.midY)) {
+            web.coordinate(withNormalizedOffset: CGVector(
+                dx: (f.midX - webFrame.minX) / webFrame.width,
+                dy: (f.midY - webFrame.minY) / webFrame.height)).tap()
         } else {
-            let f = element.frame
-            XCUIApplication().coordinate(withNormalizedOffset: .zero)
+            app.coordinate(withNormalizedOffset: .zero)
                 .withOffset(CGVector(dx: f.midX, dy: f.midY))
                 .tap()
         }
