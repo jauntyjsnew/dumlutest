@@ -255,7 +255,7 @@ final class VerifyUITests: XCTestCase {
     /// ">" the right-most button on the same row as the element with that label (an icon-only
     /// button next to a titled one).
     private func reachSheet(_ app: XCUIApplication, _ steps: [String]) -> Bool {
-        for raw in steps {
+        for (stepIndex, raw) in steps.enumerated() {
             var label = raw
             let waitOnly = label.hasPrefix("~"); if waitOnly { label.removeFirst() }
             if waitOnly {
@@ -301,10 +301,19 @@ final class VerifyUITests: XCTestCase {
             }
             guard target.waitForExistence(timeout: 180) else { snap(app, "missing-\(label)"); return false }
             bringIntoView(app, target)
+            // WHAT the label matched, never the label itself: a step that matches a piece of text
+            // instead of a button still gets "found" and tapped, does nothing at all, and the run
+            // then dies at the share sheet with no missing-step to point at.
+            print("VERIFY-STATE export step \(stepIndex): type=\(target.elementType.rawValue) "
+                  + "hittable=\(target.isHittable) enabled=\(target.isEnabled)")
             target.tap()
             sleep(2)
         }
-        return copyAction(app).waitForExistence(timeout: 180)
+        let sheet = copyAction(app).waitForExistence(timeout: 180)
+        if !sheet {
+            print("VERIFY-STATE every export step was tapped, but no share sheet appeared in 180 s")
+        }
+        return sheet
     }
 
     /// Dismiss the share sheet without sharing. On a tall phone the "Close" button can be tapped and
