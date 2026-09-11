@@ -40,6 +40,17 @@ die() {
     # too, or a failure like that reports nothing at all and cannot be diagnosed.
     grep -nE "error:|fatal error|\*\* [A-Z ]+ FAILED|No such file|command not found|Testing failed|test runner|Unable to |Failed to |Underlying error|crashed|Timed out|never launched|not available" \
       "$OUT" | tail -14 | scrub | nolabels | cut -c1-200
+    # "Failed to load the test bundle" says nothing about why. Show whether the bundle was built at
+    # all and whether it has a binary inside — our own names only, never the app's product name.
+    if grep -q "Failed to load the test bundle" "$OUT" 2>/dev/null; then
+      say "--- what was actually built ---"
+      ls "${DD:-}/Build/Products/Debug-iphonesimulator" 2>/dev/null | grep -i verifyui | head -4
+      find "${DD:-}/Build/Products" -maxdepth 4 -name "VerifyUITests.xctest" 2>/dev/null | head -2 | while read -r b; do
+        say "  xctest bundle present"
+        ls -l "$b/VerifyUITests" 2>/dev/null | awk '{print "  binary bytes:", $5}'
+        ls "$b" 2>/dev/null | head -6 | sed 's/^/  /'
+      done
+    fi
   fi
   exit 1
 }
