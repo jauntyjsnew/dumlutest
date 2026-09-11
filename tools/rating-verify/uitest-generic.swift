@@ -137,13 +137,17 @@ final class VerifyUITests: XCTestCase {
             sleep(3)
             // "Picker gone" means "picked" only after the fixture was tapped: a picker that never
             // appeared (the open control was missed) is not a pick.
-            if tappedFixture && !pickerTabs.exists && !cell.exists { picked = true; break }
+            // Open means: no picker on screen any more, and either we tapped the file or the app is
+            // already showing its name. Some pickers close before a poll ever sees the tap land.
+            if !pickerTabs.exists && !cell.exists && (tappedFixture || text.exists) { picked = true; break }
             // Icon mode: the name under the thumbnail does not pick the file; the cell's upper part
             // (the thumbnail, or the row in list mode) does. A multi-select picker also needs Open.
-            if cell.exists || (text.exists && pickerTabs.exists) {
-                if cell.exists {
+            // Only tap what is still on screen: a row that disappeared between the poll and the tap
+            // makes XCUITest fail on the coordinate itself, which reads like a test error.
+            if (cell.exists && cell.isHittable) || (text.exists && pickerTabs.exists) {
+                if cell.exists && cell.isHittable {
                     cell.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.25)).tap()
-                } else {
+                } else if text.exists {
                     text.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: -1.5)).tap()
                 }
                 tappedFixture = true
@@ -176,6 +180,21 @@ final class VerifyUITests: XCTestCase {
                 if files.exists { files.swipeUp() }
                 continue
             }
+            // No picker signal at all (no tabs, no rows, no picker title): the open control is not the
+            // biggest button on this screen. Work down the candidates by size, a different one per
+            // attempt. Tapping a wrong button costs nothing — the loop keeps looking for the picker.
+            if attempt >= 3 && !pickerTabs.exists && app.cells.count == 0
+                && !app.navigationBars.staticTexts["On My iPhone"].exists {
+                let cards = app.buttons.allElementsBoundByIndex.filter {
+                    $0.exists && $0.isHittable && $0.frame.midY < app.frame.height * 0.75
+                }.sorted { $0.frame.width * $0.frame.height > $1.frame.width * $1.frame.height }
+                let idx = attempt - 2
+                if idx < cards.count {
+                    print("VERIFY-STATE no picker; trying candidate \(idx + 1) of \(cards.count)")
+                    cards[idx].tap()
+                    continue
+                }
+            }
             // Never a navigation-bar BACK button ("On My iPhone" dismissed a fresh install's picker,
             // "Browse" bounced back out): only the location row, and the tab bar's own Browse tab.
             let location = app.cells.matching(NSPredicate(format: "label BEGINSWITH %@", "On My iPhone")).firstMatch
@@ -205,7 +224,17 @@ final class VerifyUITests: XCTestCase {
             var label = raw
             let waitOnly = label.hasPrefix("~"); if waitOnly { label.removeFirst() }
             if waitOnly {
-                guard element(app, label).waitForExistence(timeout: 300) else { snap(app, "missing-\(label)"); return false }
+                // Wait for the app's own "the job finished" words OR for the share sheet itself: an
+                // app that shares straight from the job never shows that screen, and waiting only for
+                // the words burns the whole budget on a run that already succeeded.
+                let done = element(app, label)
+                let sheet = copyAction(app)
+                var arrived = false
+                for _ in 0..<60 {
+                    if done.exists || sheet.exists { arrived = true; break }
+                    sleep(5)
+                }
+                guard arrived else { snap(app, "missing-\(label)"); return false }
                 continue
             }
             let optional = label.hasPrefix("?"); if optional { label.removeFirst() }
@@ -218,7 +247,13 @@ final class VerifyUITests: XCTestCase {
             if optional {
                 if target.waitForExistence(timeout: 5) {
                     bringIntoView(app, target)
-                    if target.isHittable { target.tap(); sleep(2) }
+                    // On screen but still not hittable (a footer button the scroll could not reach):
+                    // tap it by coordinate anyway. Skipping it silently starts no job at all, and the
+                    // wait that follows then spends its whole budget waiting for something that can
+                    // never appear.
+                    if target.isHittable { target.tap() }
+                    else { target.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).tap() }
+                    sleep(2)
                 }
                 continue
             }
