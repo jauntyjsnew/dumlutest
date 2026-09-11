@@ -1,0 +1,137 @@
+# ─── rating-verify — check a private app's App Store rating flow on a real Mac ───────────────
+#
+# WHY IT EXISTS. The rating policy (ask at every real success, at most 3 per install, never over a
+# share sheet) can only be proven by running the real app in a simulator: open a real file, share an
+# export, dismiss a sheet, and see when the prompt is asked. That needs a Mac. This is that Mac, so
+# the developer's own machine stays free.
+#
+# ⛔ THIS REPOSITORY IS PUBLIC AND THE APPS IT TESTS ARE NOT. The same contract as verify.yml:
+#   • Identity: the job takes an ALIAS. Repo, branch, bundle id and UI labels are read from the
+#     RATING_TARGETS secret and `::add-mask::`ed before anything can echo them.
+#   • Content: no step prints project output. Everything goes to a file under $RUNNER_TEMP; the
+#     console gets the alias, the on-screen rating markers, a PASS/FAIL line, and on failure a
+#     bounded path-scrubbed tail.
+#
+# ⛔ NOTHING HERE TALKS TO APPLE and nothing is signed: it builds a simulator app and runs XCUITest.
+# The simulator-only patch (RevenueCat cut, the StoreKit review call replaced by an on-screen
+# marker) is applied to the runner's checkout and is never committed anywhere.
+#
+# ⛔ IT DOES NOT PUSH. A green run is a report; moving `main` stays a human decision.
+#
+# RATING_TARGETS format — one line per app, tab separated, `#` and blanks ignored:
+#   alias  owner/repo  branch  bundle-id  kind  home  file  ready  open_asks  export  onboard  fixture  [spec-b64]
+#     kind      generic | generic-spec | native:<AppTarget> | custom:step
+#     fixture   repo:<path-in-repo>:<name>  |  gen:<mbox|gpx|xlsx|stl|zip|m4a|pdfpin>
+#
+# ADDITIVE BY CONSTRUCTION. Reads, imports and modifies no other workflow in this repository.
+
+name: rating-verify
+
+on:
+  workflow_dispatch:
+    inputs:
+      aliases:
+        description: 'RATING_TARGETS aliases, space separated (5 run at a time)'
+        required: true
+        type: string
+      failure_tail:
+        description: 'Lines of a failing run to print (0 = print nothing)'
+        required: false
+        type: string
+        default: '60'
+
+permissions:
+  contents: read
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+    steps:
+      - name: Build the alias matrix
+        id: plan
+        run: |
+          python3 - "$ALIASES" <<'PY' >> "$GITHUB_OUTPUT"
+          import json, sys
+          aliases = [a for a in sys.argv[1].split() if a]
+          print("matrix=" + json.dumps({"alias": aliases}))
+          PY
+        env:
+          ALIASES: ${{ inputs.aliases }}
+
+  verify:
+    needs: plan
+    runs-on: macos-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      max-parallel: 5
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    steps:
+      # The ONLY step that handles private names: it resolves the alias and masks every field.
+      - name: Resolve alias
+        id: t
+        env:
+          TARGETS: ${{ secrets.RATING_TARGETS }}
+          ALIAS: ${{ matrix.alias }}
+        run: |
+          line=$(printf '%s\n' "$TARGETS" | awk -F'\t' -v a="$ALIAS" '$1 == a {print; exit}')
+          [ -n "$line" ] || { echo "alias not in RATING_TARGETS"; exit 1; }
+          i=0
+          while IFS= read -r field; do
+            i=$((i+1))
+            [ -n "$field" ] && [ "$i" -gt 1 ] && echo "::add-mask::$field"
+            case $i in
+              2) echo "repo=$field" >> "$GITHUB_OUTPUT" ;;
+              3) echo "branch=$field" >> "$GITHUB_OUTPUT" ;;
+              4) echo "bundle=$field" >> "$GITHUB_OUTPUT" ;;
+              5) echo "kind=$field" >> "$GITHUB_OUTPUT" ;;
+              6) echo "home=$field" >> "$GITHUB_OUTPUT" ;;
+              7) echo "file=$field" >> "$GITHUB_OUTPUT" ;;
+              8) echo "ready=$field" >> "$GITHUB_OUTPUT" ;;
+              9) echo "open_asks=$field" >> "$GITHUB_OUTPUT" ;;
+              10) echo "export=$field" >> "$GITHUB_OUTPUT" ;;
+              11) echo "onboard=$field" >> "$GITHUB_OUTPUT" ;;
+              12) echo "fixture=$field" >> "$GITHUB_OUTPUT" ;;
+              13) echo "spec=$field" >> "$GITHUB_OUTPUT" ;;
+            esac
+          done <<EOF
+          $(printf '%s' "$line" | tr '\t' '\n')
+          EOF
+          echo "alias $ALIAS resolved"
+
+      - name: Check out this repository's tools
+        uses: actions/checkout@v4
+        with:
+          path: tools-repo
+
+      - name: Check out the app (private)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ steps.t.outputs.repo }}
+          ref: ${{ steps.t.outputs.branch }}
+          token: ${{ secrets.GH_PAT }}
+          path: app
+
+      - name: Rating flow in the simulator
+        env:
+          TOOLS: ${{ github.workspace }}/tools-repo/tools/rating-verify
+          APP_DIR: ${{ github.workspace }}/app
+          KIND: ${{ steps.t.outputs.kind }}
+          BUNDLE: ${{ steps.t.outputs.bundle }}
+          V_HOME: ${{ steps.t.outputs.home }}
+          V_FILE: ${{ steps.t.outputs.file }}
+          V_READY: ${{ steps.t.outputs.ready }}
+          V_OPEN_ASKS: ${{ steps.t.outputs.open_asks }}
+          V_EXPORT: ${{ steps.t.outputs.export }}
+          V_ONBOARD: ${{ steps.t.outputs.onboard }}
+          FIXTURE: ${{ steps.t.outputs.fixture }}
+          SPEC_B64: ${{ steps.t.outputs.spec }}
+          OUT: ${{ runner.temp }}/rating-verify.log
+          FAIL_TAIL: ${{ inputs.failure_tail }}
+        run: bash "$TOOLS/run.sh"
+
+      - name: Shred captured output
+        if: always()
+        run: rm -f "${{ runner.temp }}/rating-verify.log" || true
