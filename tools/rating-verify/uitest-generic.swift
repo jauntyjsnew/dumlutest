@@ -430,12 +430,18 @@ final class VerifyUITests: XCTestCase {
     private func tapIfExists(_ element: XCUIElement, _ timeout: TimeInterval) -> Bool {
         guard element.waitForExistence(timeout: timeout) else { return false }
         // A card that is on screen but reports "not hittable" (a web view answers hit testing for its
-        // own content) makes `tap()` fail the whole test with XCUITest's own message. Its centre still
-        // takes a tap by coordinate.
+        // own content) makes `tap()` fail the whole test with XCUITest's own message. Tapping through
+        // the element's OWN coordinate space does not reach the page either — measured on GPXview: a
+        // 362x138 card at (20,141), enabled, not hittable, and the coordinate tap changed nothing.
+        // A tap on the APPLICATION at that absolute point is a real screen touch and the web view
+        // gets it.
         if element.isHittable {
             element.tap()
         } else {
-            element.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).tap()
+            let f = element.frame
+            XCUIApplication().coordinate(withNormalizedOffset: .zero)
+                .withOffset(CGVector(dx: f.midX, dy: f.midY))
+                .tap()
         }
         return true
     }
