@@ -1,0 +1,139 @@
+#!/usr/bin/env bash
+# ─── rating-verify: one app's rating flow on a Mac runner ────────────────────
+# Drives a private app's REAL build in a simulator and checks the App Store rating policy:
+#   a real success moment asks, a share sheet closed without sharing does not, every ask happens
+#   AFTER the sheet closed (checked by clock), and the 4th success no longer asks.
+#
+# ⛔ THIS REPOSITORY IS PUBLIC AND THE APP IT TESTS IS NOT. Nothing here prints project content:
+# every command's output goes to a file under $RUNNER_TEMP; the console gets the alias, a PASS/FAIL
+# line, the on-screen rating markers ("REVIEW-VERIFY ask N of 3 at <ms>") and, on failure, a bounded
+# path-scrubbed tail. The app's name, bundle id and UI labels arrive masked from a secret.
+#
+# The simulator-only patch (RevenueCat cut + the StoreKit call replaced by an on-screen marker) is
+# applied to the RUNNER's checkout only and never committed anywhere.
+#
+# env: APP_DIR KIND BUNDLE V_HOME V_FILE V_READY V_OPEN_ASKS V_EXPORT V_ONBOARD FIXTURE [SPEC_B64]
+#      TOOLS (this directory), OUT (log file), FAIL_TAIL (default 60)
+set -uo pipefail
+TOOLS="${TOOLS:?tools dir}"; APP_DIR="${APP_DIR:?app dir}"; KIND="${KIND:?kind}"
+OUT="${OUT:-$RUNNER_TEMP/rating-verify.log}"; FAIL_TAIL="${FAIL_TAIL:-60}"
+: > "$OUT"
+say() { printf '%s\n' "$*"; }
+run() { echo "+ $*" >> "$OUT"; "$@" >> "$OUT" 2>&1; }
+die() {
+  say "FAIL: $1"
+  if [ "$FAIL_TAIL" -gt 0 ]; then
+    say "--- last $FAIL_TAIL lines (paths scrubbed) ---"
+    tail -n "$FAIL_TAIL" "$OUT" | sed -e "s#$HOME#~#g" -e "s#$APP_DIR#APP#g" -e "s#$RUNNER_TEMP#TMP#g"
+  fi
+  exit 1
+}
+
+# ── 1. simulator-only patch ──────────────────────────────────────────────────
+case "$KIND" in
+  generic)      run python3 "$TOOLS/patch-web.py" "$APP_DIR" || die "patch (template)" ;;
+  generic-spec) printf '%s' "${SPEC_B64:?spec}" | base64 -d > "$RUNNER_TEMP/spec.json"
+                run python3 "$TOOLS/patch-web.py" "$APP_DIR" "$RUNNER_TEMP/spec.json" || die "patch (spec)" ;;
+  native:*)     run python3 "$TOOLS/patch-swift.py" "$APP_DIR" || die "patch (swift)" ;;
+  *) die "unknown kind" ;;
+esac
+
+# ── 2. fixture: a file from the app's own repo, or one generated here ────────
+FIXDIR="$RUNNER_TEMP/fixture"; mkdir -p "$FIXDIR"
+case "${FIXTURE:?fixture}" in
+  repo:*) src="${FIXTURE#repo:}"; dest="${src##*:}"; src="${src%:*}"
+          [ -f "$APP_DIR/$src" ] || die "fixture missing in the app repo"
+          cp "$APP_DIR/$src" "$FIXDIR/$dest" ;;
+  gen:*)  run bash "$TOOLS/make-fixture.sh" "${FIXTURE#gen:}" "$FIXDIR" || die "fixture generator" ;;
+  *) die "unknown fixture recipe" ;;
+esac
+FIXFILE=$(ls "$FIXDIR" | head -1); [ -n "$FIXFILE" ] || die "no fixture produced"
+
+# ── 3. build the app for testing ─────────────────────────────────────────────
+cd "$APP_DIR" || die "app dir"
+ARCH=$(uname -m); [ "$ARCH" = arm64 ] && RUST_SIM=aarch64-apple-ios-sim || RUST_SIM=x86_64-apple-ios
+if [ -d rust-engine ] || [ -d engine ] || [ -d ios/rust-engine ]; then
+  run rustup target add "$RUST_SIM" || true
+fi
+case "$KIND" in
+  native:*)
+    run gem install --no-document xcodegen 2>/dev/null || true
+    command -v xcodegen >/dev/null || run brew install xcodegen || die "xcodegen"
+    run xcodegen generate || die "xcodegen generate"
+    PROJ=$(ls -d ./*.xcodeproj | head -1); TESTS_DIR=VerifyUITests; APP_TARGET="${KIND#native:}" ;;
+  *)
+    script=""
+    for cand in rust-engine/build-ios.sh ios/rust-engine/build-ios.sh engine/build-ios.sh; do
+      [ -f "$cand" ] && script="$cand" && break
+    done
+    if [ -n "$script" ]; then
+      ( cd "$(dirname "$script")" && env SDK_NAME=iphonesimulator PLATFORM_NAME=iphonesimulator \
+          EFFECTIVE_PLATFORM_NAME=-iphonesimulator ARCHS="$ARCH" bash "./$(basename "$script")" ) >> "$OUT" 2>&1 \
+        || die "rust engine build"
+    fi
+    if [ -d rust ] && [ ! -d src/wasm ]; then
+      RUST_DIR=$(find rust -maxdepth 1 -type d ! -name rust | head -1)
+      if [ -n "$RUST_DIR" ] && [ -f "$RUST_DIR/Cargo.toml" ]; then
+        run cargo install wasm-pack --locked 2>/dev/null || true
+        ENGINE=$(basename "$RUST_DIR" | sed 's/-wasm-engine//')
+        run wasm-pack build "$RUST_DIR" --target web --out-dir "../../src/wasm/${ENGINE}-engine" --release || die "wasm engine"
+      fi
+    fi
+    run npm ci --legacy-peer-deps || { rm -f package-lock.json; run npm install --legacy-peer-deps || die "npm install"; }
+    run npm run build || die "web build"
+    run npx cap sync ios || die "cap sync"
+    PROJ=ios/App/App.xcodeproj; TESTS_DIR=VerifyUITests; APP_TARGET=App
+    cd ios/App || die "ios dir" ;;
+esac
+
+mkdir -p "$TESTS_DIR"
+case "$KIND" in
+  custom:step) cp "$TOOLS/uitest-step.swift" "$TESTS_DIR/VerifyUITests.swift" ;;
+  *)           cp "$TOOLS/uitest-generic.swift" "$TESTS_DIR/VerifyUITests.swift" ;;
+esac
+run gem install --no-document xcodeproj || die "xcodeproj gem"
+run ruby "$TOOLS/add-uitest-target.rb" "$(basename "$PROJ")" "$APP_TARGET" "$TESTS_DIR" || die "add test target"
+
+DD="$RUNNER_TEMP/dd"
+XC="-project $(basename "$PROJ")"; [ -d "$(dirname "$PROJ")/App.xcworkspace" ] && XC="-workspace App.xcworkspace"
+DEV=$(xcrun simctl list devices available -j | python3 -c 'import json,sys
+d=json.load(sys.stdin)["devices"]
+best=None
+for rt,ds in d.items():
+    if "iOS" not in rt: continue
+    for x in ds:
+        if x.get("isAvailable") and "iPhone" in x["name"]: best=best or x["udid"]
+print(best or "")')
+[ -n "$DEV" ] || die "no iPhone simulator on the runner"
+run xcodebuild build-for-testing $XC -scheme VerifyUI -destination "id=$DEV" \
+  -derivedDataPath "$DD" CODE_SIGNING_ALLOWED=NO || die "build-for-testing"
+
+# ── 4. fresh install, fixture in place, then the test ────────────────────────
+run xcrun simctl boot "$DEV" || true
+run xcrun simctl bootstatus "$DEV" -b || true
+run xcrun simctl uninstall "$DEV" "${BUNDLE:?bundle}" || true
+APP=$(find "$DD/Build/Products/Debug-iphonesimulator" -maxdepth 1 -name '*.app' -type d ! -name '*-Runner.app' | head -1)
+[ -n "$APP" ] || die "built app not found"
+run xcrun simctl install "$DEV" "$APP" || die "install"
+DOCS="$(xcrun simctl get_app_container "$DEV" "$BUNDLE" data)/Documents"; mkdir -p "$DOCS"; cp "$FIXDIR/$FIXFILE" "$DOCS/"
+for g in "$HOME/Library/Developer/CoreSimulator/Devices/$DEV"/data/Containers/Shared/AppGroup/*; do
+  id=$(/usr/libexec/PlistBuddy -c 'Print :MCMMetadataIdentifier' "$g/.com.apple.mobile_container_manager.metadata.plist" 2>/dev/null || true)
+  [ "$id" = "group.com.apple.FileProvider.LocalStorage" ] && mkdir -p "$g/File Provider Storage" && cp "$FIXDIR/$FIXFILE" "$g/File Provider Storage/"
+done
+
+export TEST_RUNNER_V_HOME="${V_HOME:-}" TEST_RUNNER_V_FILE="${V_FILE:-}" TEST_RUNNER_V_READY="${V_READY:-}"
+export TEST_RUNNER_V_OPEN_ASKS="${V_OPEN_ASKS:-0}" TEST_RUNNER_V_EXPORT="${V_EXPORT:-}" TEST_RUNNER_V_ONBOARD="${V_ONBOARD:-}"
+XCTESTRUN=$(ls "$DD"/Build/Products/*.xctestrun | head -1)
+run xcodebuild test-without-building -xctestrun "$XCTESTRUN" -destination "id=$DEV" \
+  -only-testing:"VerifyUITests/VerifyUITests/testRatingFlow"
+rc=$?
+xcrun simctl shutdown "$DEV" >/dev/null 2>&1 || true
+
+# ── 5. verdict: only the markers and the counts reach the log ────────────────
+asks=$(grep -oE "REVIEW-VERIFY ask [0-9] of 3 at [0-9]+" "$OUT" | sort -u)
+executed=$(grep -oE 'Executed [0-9]+ tests?, with [0-9]+ failures?' "$OUT" | tail -1)
+say "asks seen on screen:"; printf '%s\n' "${asks:-  (none)}" | sed 's/^/  /'
+say "xctest: ${executed:-none}"
+[ "$rc" -eq 0 ] || die "testRatingFlow ($executed)"
+printf '%s' "$executed" | grep -q "with 0 failures" || die "testRatingFlow ($executed)"
+say "PASS"
