@@ -29,7 +29,7 @@ final class VerifyUITests: XCTestCase {
         let app = XCUIApplication()
         app.launch()
         passOnboarding(app, home: home)
-        openFile(app, home: home, name: file)
+        openFile(app, home: home, name: file, ready: ready)
 
         // The configured "ready" words belong to the app, and a run can carry wording this app no
         // longer uses. The file's own name, rendered by the app after the picker is gone, is proof
@@ -118,7 +118,7 @@ final class VerifyUITests: XCTestCase {
     /// Picks the fixture from Files › On My iPhone. A fresh install's picker may open inside the
     /// app's own (empty) folder, so walk up with the "On My iPhone" back button, or go through
     /// Browse › On My iPhone, until the fixture shows.
-    private func openFile(_ app: XCUIApplication, home: String, name: String) {
+    private func openFile(_ app: XCUIApplication, home: String, name: String, ready: String) {
         let target = element(app, home)
         if !(target.waitForExistence(timeout: 20) && target.isHittable) {
             // Say what the screen was, without printing any of the app's own words: is the home
@@ -156,6 +156,12 @@ final class VerifyUITests: XCTestCase {
             // "The picker is gone" must not mean "the row is gone": an app lists the file it just
             // opened as a row of its own (a track list), so that row never disappears. Judge it by
             // the picker's own furniture — its tabs and its title — and nothing else.
+            // The strongest signal is the app itself: once what it shows for an opened file is on
+            // screen, the file IS open — whatever the picker's leftovers look like. pdf-password-
+            // recovery proved the other way round is not safe: its own tab bar carries a "Browse"
+            // button, so "the picker is still up" stayed true forever and an opened file was called
+            // missing.
+            if tappedFixture && labeled(app, ready).exists { picked = true; break }
             let pickerUp = pickerTabs.exists || app.navigationBars.staticTexts["On My iPhone"].exists
             if !pickerUp && (tappedFixture || text.exists) { picked = true; break }
             // Icon mode: the name under the thumbnail does not pick the file; the cell's upper part
@@ -299,6 +305,11 @@ final class VerifyUITests: XCTestCase {
                 }
                 if target.exists {
                     bringIntoView(app, target)
+                    // Optional steps were the one kind that left no trace, so "it was tapped" and
+                    // "it matched a piece of text and the tap did nothing" looked identical in the
+                    // log — which is exactly where pst-split-merge is stuck.
+                    print("VERIFY-STATE optional export step \(stepIndex): type=\(target.elementType.rawValue) "
+                          + "hittable=\(target.isHittable) enabled=\(target.isEnabled)")
                     // On screen but still not hittable (a footer button the scroll could not reach):
                     // tap it by coordinate anyway. Skipping it silently starts no job at all, and the
                     // wait that follows then spends its whole budget waiting for something that can
