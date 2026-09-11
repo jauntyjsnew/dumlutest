@@ -168,30 +168,83 @@ PY
 rm -rf ios/App/CapApp-SPM
 
 echo "── 2/3 patch the plugins that cannot compile for Catalyst as shipped"
-# ⛔ Defensive. If the SDK moved the call, FAIL — an unpatched build breaks at
-# link time and the reason is found days later. But an app with NO RevenueCat
-# has nothing to patch, and r.yml's `RC Patch` walks past it (kgtolb has none):
-# refusing there was red for an app r.yml ships.
-python3 - <<'PY'
-import glob, os, sys
-if not os.path.isdir("node_modules/@revenuecat/purchases-capacitor"):
-    print("  RevenueCat not installed — nothing to patch"); sys.exit(0)
-hits = [h for h in glob.glob("node_modules/@revenuecat/purchases-capacitor/ios/**/PurchasesPlugin.swift", recursive=True)]
-if not hits:
-    sys.exit("  RevenueCat plugin source not found — the patch target moved")
-p = hits[0]
-s = open(p).read()
-target = ("        if #available(iOS 14.0, *) {\n"
-          "            CommonFunctionality.presentCodeRedemptionSheet()\n"
-          "        }")
-if "#if !targetEnvironment(macCatalyst)\n" + target in s:
-    print("  already patched"); sys.exit(0)
-if target not in s:
-    sys.exit("  RevenueCat patch target not found — refusing to produce an unpatched Catalyst build")
-open(p, "w").write(s.replace(target,
-    "        #if !targetEnvironment(macCatalyst)\n" + target + "\n        #endif"))
-print("  patched")
+# r.yml `RC Patch`, the same three rules: no PurchasesPlugin.swift under the
+# package's ios/ -> nothing to do (kgtolb has no RevenueCat at all); the file
+# already says `#if !targetEnvironment(macCatalyst)` ANYWHERE -> nothing to do;
+# otherwise r.yml's own sed wraps every `CommonFunctionality.presentCodeRedemptionSheet()`.
+# ⛔ MEASURED 2026-09-10, stlviewer (RevenueCat 12.2.2): this block used to demand
+# one exact `if #available(iOS 14.0, *) {…}` block and refuse anything else.
+# RevenueCat ships no guard (every release checked, 9.0.9 to 13.5.1, carries that
+# bare block); stlviewer's COMMITTED Podfile adds one in its post_install, which
+# `cap sync` runs above — a column-0 `#if` INSIDE the `if #available` block. r.yml
+# skipped that file and shipped, while this script stopped here, red. With
+# r.yml's rule the same commit built for Mac: BUILD SUCCEEDED, x86_64 arm64, platform 6.
+# ⛔ Still defensive, about the ANSWER rather than the shape: once r.yml's edit is
+# done, is a presentCodeRedemptionSheet call left that Mac Catalyst compiles?
+# RevenueCat's own wrapper is unavailable there (top of this file), so that is
+# exit 65 in r.yml's build too — a guard elsewhere in the file makes r.yml skip,
+# and its sed only sees the one-line call. Refuse, naming the line, instead of
+# building to the same red.
+RC_IOS=node_modules/@revenuecat/purchases-capacitor/ios
+if [ ! -d "$RC_IOS" ]; then
+  echo "  RevenueCat not installed — nothing to patch"
+else
+  PLUGIN_FILE=$(find "$RC_IOS" -name "PurchasesPlugin.swift" 2>/dev/null | head -n 1 || true)
+  if [ -z "$PLUGIN_FILE" ] || [ ! -f "$PLUGIN_FILE" ]; then
+    echo "  RevenueCat: no PurchasesPlugin.swift — r.yml patches nothing"
+  elif grep -q "#if !targetEnvironment(macCatalyst)" "$PLUGIN_FILE"; then
+    echo "  RevenueCat: already says #if !targetEnvironment(macCatalyst) — r.yml patches nothing"
+  else
+    sed -i.bak 's/CommonFunctionality\.presentCodeRedemptionSheet()/#if !targetEnvironment(macCatalyst)\n            CommonFunctionality.presentCodeRedemptionSheet()\n            #else\n            \/\/ Not available on Mac Catalyst\n            call.reject("Not available on Mac Catalyst")\n            return\n            #endif/g' "$PLUGIN_FILE"
+    echo "  RevenueCat: wrapped with r.yml's sed"
+  fi
+  python3 - "$RC_IOS" <<'PY'
+import os, re, sys
+CAT = "targetEnvironment(macCatalyst)"
+
+def catalyst_skips(chain):
+    # One #if/#elseif/#else chain up to the branch a line sits in; None = #else.
+    *earlier, here = chain
+    if CAT in earlier:
+        return True
+    return here is not None and "||" not in here and "!" + CAT in here.split("&&")
+
+guarded, reachable = 0, []
+for root, dirs, files in os.walk(sys.argv[1]):
+    dirs[:] = sorted(d for d in dirs if not d.endswith("Tests"))   # the pod compiles no tests
+    for name in sorted(f for f in files if f.endswith(".swift")):
+        path = os.path.join(root, name)
+        src = re.sub(r"/\*.*?\*/", lambda m: "\n" * m.group().count("\n"),
+                     open(path, encoding="utf-8").read(), flags=re.S)
+        chains = []
+        for n, line in enumerate(src.split("\n"), 1):
+            code = re.sub(r'"(?:\\.|[^"\\])*"', '""', line).split("//")[0]
+            for call in re.finditer(r"\bpresentCodeRedemptionSheet\s*\(", code):
+                if re.search(r"\bfunc\s+$", code[:call.start()]):
+                    continue
+                if any(catalyst_skips(c) for c in chains):
+                    guarded += 1
+                else:
+                    reachable.append("%s:%d" % (path, n))
+            directive = re.match(r"\s*#(if|elseif|else|endif)\b(.*)", code)
+            if not directive:
+                continue
+            kind, cond = directive.group(1), re.sub(r"\s+", "", directive.group(2))
+            if kind == "if":
+                chains.append([cond])
+            elif chains and kind == "endif":
+                chains.pop()
+            elif chains:
+                chains[-1].append(cond if kind == "elseif" else None)
+if reachable:
+    print("  ⛔ Mac Catalyst still compiles presentCodeRedemptionSheet at " + ", ".join(reachable))
+    print("  RevenueCat's wrapper is unavailable on Mac Catalyst, so r.yml's build of this commit fails to compile:"
+          " its RC Patch left the call as it is (a guard elsewhere in the file makes it skip; its sed matches"
+          " only the one-line call). Refusing instead of building to the same red.")
+    sys.exit(1)
+print("  RevenueCat: %d presentCodeRedemptionSheet call(s), none reachable on Mac Catalyst" % guarded)
 PY
+fi
 # r.yml `Geolocation Catalyst Patch`. @capacitor/geolocation 8 imports
 # IONGeolocationLib, another prebuilt .xcframework, and r.yml builds the Mac app
 # without it: on Catalyst the plugin becomes a stub that rejects every call, and
