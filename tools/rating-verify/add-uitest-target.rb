@@ -35,6 +35,16 @@ else
     s['DEVELOPMENT_TEAM'] = ''
     s['CODE_SIGNING_REQUIRED'] = 'NO'
     s['TARGETED_DEVICE_FAMILY'] = '1,2'
+    # ⛔ Do not inherit the app's pod linkage. A UI test bundle is loaded into its OWN runner app,
+    # which carries none of the app's embedded frameworks. When a Podfile has no explicit target
+    # block, CocoaPods applies its xcconfig at the PROJECT level, so a target created afterwards
+    # inherits OTHER_LDFLAGS full of -framework flags; the bundle then links the app's dynamic pods
+    # and dyld cannot resolve a single one of them. Measured on dng-to-jpg: 11 @rpath dependencies
+    # (Capacitor, CapacitorApp, CapacitorRateApp, CapacitorShare, CapawesomeCapacitorFilePicker,
+    # Cordova, PurchasesHybridCommon, RevenueCat, ...) and "Failed to load the test bundle", with no
+    # reason in the log. XCTest itself comes from the target type, not from these flags.
+    s['OTHER_LDFLAGS'] = ''
+    s['LD_RUNPATH_SEARCH_PATHS'] = '$(inherited) @executable_path/Frameworks @loader_path/Frameworks'
   end
   proj.save
   puts "added #{name} (deployment #{deployment})"
