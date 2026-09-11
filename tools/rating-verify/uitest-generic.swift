@@ -314,7 +314,19 @@ final class VerifyUITests: XCTestCase {
                 // then spent its whole budget on a screen that could never change. Say which way it
                 // went, so a failing run tells "skipped" apart from "tapped".
                 if !target.waitForExistence(timeout: 20) {
-                    print("VERIFY-STATE optional export step not on screen; skipped")
+                    print("VERIFY-STATE optional export step \(stepIndex) not on screen; skipped")
+                    // Shapes when it is missing — the one case that still printed nothing. On
+                    // stl-viewer-converter the SAME label passes the "file is on screen" check and is
+                    // then gone by the time the export starts, which only makes sense if something
+                    // covered the screen in between (a teaser paywall) or the control was replaced.
+                    // Counts and rectangles tell those apart; no labels, the log is public.
+                    print("VERIFY-STATE   screen now: buttons=\(app.buttons.count) "
+                          + "staticTexts=\(app.staticTexts.count) sheetUp=\(copyAction(app).exists)")
+                    for b in app.buttons.allElementsBoundByIndex.prefix(8) {
+                        let f = b.frame
+                        print("VERIFY-STATE   button at (\(Int(f.minX)),\(Int(f.minY))) "
+                              + "size \(Int(f.width))x\(Int(f.height)) hittable=\(b.isHittable)")
+                    }
                 }
                 if target.exists {
                     bringIntoView(app, target)
