@@ -377,10 +377,10 @@ final class VerifyUITests: XCTestCase {
     }
 
     private func snap(_ app: XCUIApplication, _ name: String) {
-        let shot = XCTAttachment(screenshot: app.screenshot())
-        shot.name = name
-        shot.lifetime = .keepAlways
-        add(shot)
+        // No screenshot attachment. Nothing ever reads the .xcresult here, and on a loaded runner
+        // `app.screenshot()` times out ("Failed to get screenshot") — which fails the test for a
+        // reason that has nothing to do with the rating policy. The tree below is what the step
+        // breadcrumbs are built from, and it goes to the log file, never to the public console.
         print("VERIFY-TREE \(name) BEGIN\n\(app.debugDescription)\nVERIFY-TREE \(name) END")
     }
 }
