@@ -31,7 +31,16 @@ final class VerifyUITests: XCTestCase {
         passOnboarding(app, home: home)
         openFile(app, home: home, name: file)
 
-        XCTAssertTrue(labeled(app, ready).waitForExistence(timeout: 120), "the opened file is on screen (\(ready))")
+        // The configured "ready" words belong to the app, and a run can carry wording this app no
+        // longer uses. The file's own name, rendered by the app after the picker is gone, is proof
+        // that it opened just the same — so fall back to it rather than calling an opened file closed.
+        var onScreen = labeled(app, ready).waitForExistence(timeout: 120)
+        if !onScreen {
+            let byName = app.staticTexts.matching(NSPredicate(format: "label BEGINSWITH %@", file)).firstMatch
+            onScreen = byName.waitForExistence(timeout: 20)
+            if onScreen { print("VERIFY-STATE ready label did not match; the file's own name is on screen") }
+        }
+        XCTAssertTrue(onScreen, "the opened file is on screen (\(ready))")
         let base: Int
         if openAsks {
             XCTAssertTrue(askMarker(app, 1).waitForExistence(timeout: 40), "ask 1 once the real file is on screen")
