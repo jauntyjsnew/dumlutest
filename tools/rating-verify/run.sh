@@ -27,6 +27,8 @@ die() {
     say "--- steps the test reached ---"
     grep -oE "VERIFY-TREE [A-Za-z0-9-]+ BEGIN" "$OUT" | sed -e 's/VERIFY-TREE //' -e 's/ BEGIN//' | uniq | tr '\n' ' '
     echo
+    say "--- what the screen was when it broke ---"
+    grep -a -o "VERIFY-STATE .*" "$OUT" | head -3
     say "--- assertions that failed ---"
     grep -o "testRatingFlow\] : .*" "$OUT" | sed 's/^testRatingFlow\] : //' | head -12 | cut -c1-160
     say "--- build / run errors ---"
@@ -101,16 +103,32 @@ run ruby "$TOOLS/add-uitest-target.rb" "$(basename "$PROJ")" "$APP_TARGET" "$TES
 
 DD="$RUNNER_TEMP/dd"
 XC="-project $(basename "$PROJ")"; [ -d App.xcworkspace ] && XC="-workspace App.xcworkspace"
-DEV=$(xcrun simctl list devices available -j | python3 -c 'import json,sys
+# The same small phone the policy was verified on locally: a 4.7" screen puts the export controls
+# below the fold, which is exactly the case the test has to survive. Fall back to any iPhone.
+pick_device() {
+  xcrun simctl list devices available -j | python3 -c 'import json,sys
 d = json.load(sys.stdin)["devices"]
-pick = None
+se = None; any_iphone = None
 for rt, ds in d.items():
     if "iOS" not in rt:
         continue
     for x in ds:
-        if x.get("isAvailable") and "iPhone" in x["name"] and pick is None:
-            pick = x["udid"]
-print(pick or "")')
+        if not x.get("isAvailable"):
+            continue
+        if "iPhone SE" in x["name"] and se is None:
+            se = x["udid"]
+        if "iPhone" in x["name"] and any_iphone is None:
+            any_iphone = x["udid"]
+print(se or any_iphone or "")'
+}
+DEV=$(pick_device)
+if ! xcrun simctl list devices available | grep -q "iPhone SE"; then
+  RT=$(xcrun simctl list runtimes -j | python3 -c 'import json,sys
+rs = [r for r in json.load(sys.stdin)["runtimes"] if r.get("isAvailable") and "iOS" in r["name"]]
+print(rs[-1]["identifier"] if rs else "")')
+  [ -n "$RT" ] && run xcrun simctl create rating-verify-se \
+    "com.apple.CoreSimulator.SimDeviceType.iPhone-SE-3rd-generation" "$RT" && DEV=$(pick_device)
+fi
 [ -n "$DEV" ] || die "no iPhone simulator on the runner"
 say "device: $(xcrun simctl list devices | grep "$DEV" | sed -e 's/^ *//' -e "s/ ($DEV).*//")"
 run xcodebuild build-for-testing $XC -scheme VerifyUI -destination "id=$DEV" \
