@@ -360,7 +360,14 @@ final class VerifyUITests: XCTestCase {
     @discardableResult
     private func tapIfExists(_ element: XCUIElement, _ timeout: TimeInterval) -> Bool {
         guard element.waitForExistence(timeout: timeout) else { return false }
-        element.tap()
+        // A card that is on screen but reports "not hittable" (a web view answers hit testing for its
+        // own content) makes `tap()` fail the whole test with XCUITest's own message. Its centre still
+        // takes a tap by coordinate.
+        if element.isHittable {
+            element.tap()
+        } else {
+            element.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).tap()
+        }
         return true
     }
 
