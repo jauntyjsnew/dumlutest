@@ -49,6 +49,14 @@ die() {
         say "  xctest bundle present"
         ls -l "$b/VerifyUITests" 2>/dev/null | awk '{print "  binary bytes:", $5}'
         ls "$b" 2>/dev/null | head -6 | sed 's/^/  /'
+        # The bundle exists and has a binary, so the reason it will not LOAD is one of: built for the
+        # wrong architecture, or a dependency it cannot resolve. Architectures are safe to print;
+        # any dependency path carrying the app's own name is masked by the workflow already.
+        say "  test binary:   $(file -b "$b/VerifyUITests" 2>/dev/null | cut -c1-90)"
+        say "  runner binary: $(file -b "${DD:-}/Build/Products/Debug-iphonesimulator/VerifyUITests-Runner.app/VerifyUITests-Runner" 2>/dev/null | cut -c1-90)"
+        say "  @rpath dependencies:"
+        otool -L "$b/VerifyUITests" 2>/dev/null | grep -c "@rpath" | sed 's/^/    count: /'
+        otool -L "$b/VerifyUITests" 2>/dev/null | grep "@rpath" | sed 's#.*/##' | cut -c1-60 | head -8 | sed 's/^/    /'
       done
     fi
   fi
