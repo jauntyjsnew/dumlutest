@@ -21,6 +21,9 @@ OUT="${OUT:-$RUNNER_TEMP/rating-verify.log}"; FAIL_TAIL="${FAIL_TAIL:-60}"
 say() { printf '%s\n' "$*"; }
 run() { echo "+ $*" >> "$OUT"; "$@" >> "$OUT" 2>&1; }
 scrub() { sed -e "s#$HOME#~#g" -e "s#$APP_DIR#APP#g" -e "s#$RUNNER_TEMP#TMP#g"; }
+# XCUITest quotes the element it could not use, and that quote carries the app's own on-screen words
+# ("label: '...'"). THIS REPOSITORY IS PUBLIC: keep the failure, drop the app's words.
+nolabels() { sed -e "s/,* *label: .*$//" -e "s/,* *identifier: .*$//"; }
 die() {
   say "FAIL: $1"
   if [ "$FAIL_TAIL" -gt 0 ]; then
@@ -30,13 +33,13 @@ die() {
     say "--- what the screen was when it broke ---"
     grep -a -o "VERIFY-STATE .*" "$OUT" | head -3
     say "--- assertions that failed ---"
-    grep -o "testRatingFlow\] : .*" "$OUT" | sed 's/^testRatingFlow\] : //' | head -12 | cut -c1-160
+    grep -o "testRatingFlow\] : .*" "$OUT" | sed 's/^testRatingFlow\] : //' | head -12 | nolabels | cut -c1-160
     say "--- build / run errors ---"
     # A test that never ran leaves no assertion and no "error:" line — the reason is phrased by
     # xcodebuild or CoreSimulator instead ("The test runner exited", "Unable to boot"). Match those
     # too, or a failure like that reports nothing at all and cannot be diagnosed.
     grep -nE "error:|fatal error|\*\* [A-Z ]+ FAILED|No such file|command not found|Testing failed|test runner|Unable to |Failed to |Underlying error|crashed|Timed out|never launched|not available" \
-      "$OUT" | tail -14 | scrub | cut -c1-200
+      "$OUT" | tail -14 | scrub | nolabels | cut -c1-200
   fi
   exit 1
 }
