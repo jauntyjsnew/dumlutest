@@ -45,8 +45,14 @@ die() {
 }
 
 # ── 1. simulator-only patch ──────────────────────────────────────────────────
+TEST_FILE=uitest-generic.swift
 case "$KIND" in
   generic)      run python3 "$TOOLS/patch-web.py" "$APP_DIR" || die "patch (template)" ;;
+  # An app the environment-driven driver cannot describe (its success moment is inside its own 3D
+  # viewer) brings its own test file. Same patch, same class and test name, so nothing else changes.
+  custom:*)     TEST_FILE="${KIND#custom:}"
+                [ -f "$TOOLS/$TEST_FILE" ] || die "custom test file missing"
+                run python3 "$TOOLS/patch-web.py" "$APP_DIR" || die "patch (custom)" ;;
   generic-spec) printf '%s' "${SPEC_B64:?spec}" | base64 -d > "$RUNNER_TEMP/spec.json"
                 run python3 "$TOOLS/patch-web.py" "$APP_DIR" "$RUNNER_TEMP/spec.json" || die "patch (spec)" ;;
   native:*)     run python3 "$TOOLS/patch-swift.py" "$APP_DIR" || die "patch (swift)" ;;
@@ -116,7 +122,7 @@ esac
 say "build: web and native inputs ready"
 
 mkdir -p "$TESTS_DIR"
-cp "$TOOLS/uitest-generic.swift" "$TESTS_DIR/VerifyUITests.swift"
+cp "$TOOLS/$TEST_FILE" "$TESTS_DIR/VerifyUITests.swift"
 run gem install --no-document xcodeproj || die "xcodeproj gem"
 run ruby "$TOOLS/add-uitest-target.rb" "$(basename "$PROJ")" "$APP_TARGET" "$TESTS_DIR" || die "add test target"
 
