@@ -32,7 +32,11 @@ die() {
     say "--- assertions that failed ---"
     grep -o "testRatingFlow\] : .*" "$OUT" | sed 's/^testRatingFlow\] : //' | head -12 | cut -c1-160
     say "--- build / run errors ---"
-    grep -nE "error:|fatal error|\*\* [A-Z ]+ FAILED|No such file|command not found" "$OUT" | tail -10 | scrub | cut -c1-200
+    # A test that never ran leaves no assertion and no "error:" line — the reason is phrased by
+    # xcodebuild or CoreSimulator instead ("The test runner exited", "Unable to boot"). Match those
+    # too, or a failure like that reports nothing at all and cannot be diagnosed.
+    grep -nE "error:|fatal error|\*\* [A-Z ]+ FAILED|No such file|command not found|Testing failed|test runner|Unable to |Failed to |Underlying error|crashed|Timed out|never launched|not available" \
+      "$OUT" | tail -14 | scrub | cut -c1-200
   fi
   exit 1
 }
@@ -76,6 +80,12 @@ case "$KIND" in
       [ -f "$cand" ] && script="$cand" && break
     done
     if [ -n "$script" ]; then
+      # These engines build with `cargo --offline`: fine on a machine whose registry already holds the
+      # crates, but a fresh runner has an empty one and the build dies with "no matching package
+      # named ...". Fill the registry from the lockfile first.
+      run cargo fetch --locked --manifest-path "$(dirname "$script")/Cargo.toml" \
+        || run cargo fetch --manifest-path "$(dirname "$script")/Cargo.toml" \
+        || die "cargo fetch (engine dependencies)"
       ( cd "$(dirname "$script")" && env SDK_NAME=iphonesimulator PLATFORM_NAME=iphonesimulator \
           EFFECTIVE_PLATFORM_NAME=-iphonesimulator ARCHS="$ARCH" bash "./$(basename "$script")" ) >> "$OUT" 2>&1 \
         || die "rust engine build"
