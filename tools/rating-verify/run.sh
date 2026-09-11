@@ -126,8 +126,14 @@ if ! xcrun simctl list devices available | grep -q "iPhone SE"; then
   RT=$(xcrun simctl list runtimes -j | python3 -c 'import json,sys
 rs = [r for r in json.load(sys.stdin)["runtimes"] if r.get("isAvailable") and "iOS" in r["name"]]
 print(rs[-1]["identifier"] if rs else "")')
-  [ -n "$RT" ] && run xcrun simctl create rating-verify-se \
-    "com.apple.CoreSimulator.SimDeviceType.iPhone-SE-3rd-generation" "$RT" && DEV=$(pick_device)
+  TYPE=$(xcrun simctl list devicetypes -j | python3 -c 'import json,sys
+ts = [t for t in json.load(sys.stdin)["devicetypes"] if "iPhone SE" in t["name"]]
+print(ts[-1]["identifier"] if ts else "")')
+  if [ -n "$RT" ] && [ -n "$TYPE" ] && xcrun simctl create rating-verify-se "$TYPE" "$RT" >> "$OUT" 2>&1; then
+    DEV=$(pick_device); say "device: created a small phone for this run"
+  else
+    say "device: no small phone available on this runner, using the default one"
+  fi
 fi
 [ -n "$DEV" ] || die "no iPhone simulator on the runner"
 say "device: $(xcrun simctl list devices | grep "$DEV" | sed -e 's/^ *//' -e "s/ ($DEV).*//")"
