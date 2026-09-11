@@ -92,8 +92,10 @@ case "$KIND" in
       # These engines build with `cargo --offline`: fine on a machine whose registry already holds the
       # crates, but a fresh runner has an empty one and the build dies with "no matching package
       # named ...". Fill the registry from the lockfile first.
-      run cargo fetch --locked --manifest-path "$(dirname "$script")/Cargo.toml" \
-        || run cargo fetch --manifest-path "$(dirname "$script")/Cargo.toml" \
+      # Not --locked: an engine without a checked-in Cargo.lock fails outright on it, and the error
+      # ("cannot create the lock file ... because --locked was passed") then sits in the log looking
+      # like the cause of whatever fails later.
+      run cargo fetch --manifest-path "$(dirname "$script")/Cargo.toml" \
         || die "cargo fetch (engine dependencies)"
       ( cd "$(dirname "$script")" && env SDK_NAME=iphonesimulator PLATFORM_NAME=iphonesimulator \
           EFFECTIVE_PLATFORM_NAME=-iphonesimulator ARCHS="$ARCH" bash "./$(basename "$script")" ) >> "$OUT" 2>&1 \
