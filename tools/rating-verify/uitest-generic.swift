@@ -285,7 +285,20 @@ final class VerifyUITests: XCTestCase {
                     if done.exists || sheet.exists { arrived = true; break }
                     sleep(5)
                 }
-                guard arrived else { snap(app, "missing-\(label)"); return false }
+                guard arrived else {
+                    snap(app, "missing-\(label)")
+                    // What IS on screen, as shapes only — the log is public. Without this, a wait that
+                    // times out says nothing about whether the job finished, never started, or ended
+                    // on a screen whose wording this run does not know.
+                    print("VERIFY-STATE waited for a finish that never came: buttons=\(app.buttons.count) "
+                          + "staticTexts=\(app.staticTexts.count) sheetUp=\(copyAction(app).exists)")
+                    for b in app.buttons.allElementsBoundByIndex.prefix(8) {
+                        let f = b.frame
+                        print("VERIFY-STATE   button at (\(Int(f.minX)),\(Int(f.minY))) "
+                              + "size \(Int(f.width))x\(Int(f.height)) hittable=\(b.isHittable)")
+                    }
+                    return false
+                }
                 continue
             }
             let optional = label.hasPrefix("?"); if optional { label.removeFirst() }
