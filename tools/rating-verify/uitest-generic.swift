@@ -235,6 +235,15 @@ final class VerifyUITests: XCTestCase {
             print("VERIFY-STATE picker tabs=\(pickerTabs.exists) fixtureCell=\(cell.exists) fixtureText=\(text.exists) "
                   + "onMyIPhoneTitle=\(app.navigationBars.staticTexts["On My iPhone"].exists) "
                   + "browseTab=\(app.tabBars.buttons["Browse"].exists) cells=\(app.cells.count) buttons=\(app.buttons.count)")
+            // The fixture's own row: where it is, what kind of element it is, and whether XCUITest
+            // thinks it can be tapped. This is what separates "we are tapping the wrong rectangle"
+            // from "the tap lands and the picker does nothing with it". No labels — the log is public.
+            for (what, e) in [("cell", cell), ("text", text)] where e.exists {
+                let f = e.frame
+                print("VERIFY-STATE fixture \(what) at (\(Int(f.minX)),\(Int(f.minY))) "
+                      + "size \(Int(f.width))x\(Int(f.height)) type=\(e.elementType.rawValue) "
+                      + "hittable=\(e.isHittable) selected=\(e.isSelected)")
+            }
             // Shapes only — where the tappable things are and whether they can be tapped at all.
             // No labels and no text: this log is public. It is the only way to tell "the open control
             // is not where we tap" from "the tap lands and the picker still never opens".
