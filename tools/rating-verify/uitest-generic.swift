@@ -139,7 +139,11 @@ final class VerifyUITests: XCTestCase {
             // appeared (the open control was missed) is not a pick.
             // Open means: no picker on screen any more, and either we tapped the file or the app is
             // already showing its name. Some pickers close before a poll ever sees the tap land.
-            if !pickerTabs.exists && !cell.exists && (tappedFixture || text.exists) { picked = true; break }
+            // "The picker is gone" must not mean "the row is gone": an app lists the file it just
+            // opened as a row of its own (a track list), so that row never disappears. Judge it by
+            // the picker's own furniture — its tabs and its title — and nothing else.
+            let pickerUp = pickerTabs.exists || app.navigationBars.staticTexts["On My iPhone"].exists
+            if !pickerUp && (tappedFixture || text.exists) { picked = true; break }
             // Icon mode: the name under the thumbnail does not pick the file; the cell's upper part
             // (the thumbnail, or the row in list mode) does. A multi-select picker also needs Open.
             // Only tap what is still on screen: a row that disappeared between the poll and the tap
@@ -154,9 +158,17 @@ final class VerifyUITests: XCTestCase {
                 sleep(3)
                 // Only the PICKER's Open (its navigation bar, while it is up): an app can have its own
                 // "Open" tab, and tapping that leaves the file that was just opened.
-                let pickerOpen = app.navigationBars.buttons["Open"].firstMatch
-                if pickerTabs.exists && pickerOpen.exists && pickerOpen.isEnabled { pickerOpen.tap(); sleep(3) }
-                if !pickerTabs.exists && !cell.exists { picked = true; break }
+                // The picker's own Open — its navigation bar OR its toolbar; in grid mode a tap only
+                // selects and Open is what opens. Never a TAB bar button: an app can have an "Open"
+                // tab of its own, and tapping that leaves the file that was just opened.
+                for bar in [app.navigationBars, app.toolbars] {
+                    let open = bar.buttons["Open"].firstMatch
+                    if pickerTabs.exists && open.exists && open.isEnabled { open.tap(); sleep(3); break }
+                }
+                if !pickerTabs.exists && !app.navigationBars.staticTexts["On My iPhone"].exists {
+                    picked = true
+                    break
+                }
                 snap(app, "picker-tapped-\(attempt)")
                 continue
             }
