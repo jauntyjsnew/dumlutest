@@ -133,11 +133,7 @@ final class VerifyUITests: XCTestCase {
             // The configured words are not on this screen (a different layout, or wording this run
             // does not know). These apps all put file opening in one big card near the top, so fall
             // back to the largest tappable area in the top two thirds rather than guessing wording.
-            let cards = app.buttons.allElementsBoundByIndex.filter {
-                $0.exists && $0.isHittable && $0.frame.midY < app.frame.height * 0.75
-            }
-            if let big = cards.max(by: { $0.frame.width * $0.frame.height < $1.frame.width * $1.frame.height }),
-               big.frame.width * big.frame.height > 5000 {
+            if let big = openCandidates(app).first {
                 print("VERIFY-STATE fallback=largest-card area=\(Int(big.frame.width * big.frame.height))")
                 opener = big
             }
@@ -200,11 +196,7 @@ final class VerifyUITests: XCTestCase {
             // No picker at all: the first tap landed on text inside the open-file card instead of the
             // card. Tap the biggest tappable area in the top two thirds once, then keep looking.
             if attempt == 1 && !pickerTabs.exists {
-                let cards = app.buttons.allElementsBoundByIndex.filter {
-                    $0.exists && $0.isHittable && $0.frame.midY < app.frame.height * 0.75
-                }
-                if let big = cards.max(by: { $0.frame.width * $0.frame.height < $1.frame.width * $1.frame.height }),
-                   big.frame.width * big.frame.height > 5000 {
+                if let big = openCandidates(app).first {
                     print("VERIFY-STATE no picker yet; tapping largest card area=\(Int(big.frame.width * big.frame.height))")
                     big.tap()
                     continue
@@ -221,12 +213,12 @@ final class VerifyUITests: XCTestCase {
             // attempt. Tapping a wrong button costs nothing — the loop keeps looking for the picker.
             if attempt >= 3 && !pickerTabs.exists && app.cells.count == 0
                 && !app.navigationBars.staticTexts["On My iPhone"].exists {
-                let cards = app.buttons.allElementsBoundByIndex.filter {
-                    $0.exists && $0.isHittable && $0.frame.midY < app.frame.height * 0.75
-                }.sorted { $0.frame.width * $0.frame.height > $1.frame.width * $1.frame.height }
+                let cards = openCandidates(app)
                 let idx = attempt - 2
                 if idx < cards.count {
-                    print("VERIFY-STATE no picker; trying candidate \(idx + 1) of \(cards.count)")
+                    let f = cards[idx].frame
+                    print("VERIFY-STATE no picker; trying candidate \(idx + 1) of \(cards.count) "
+                          + "at (\(Int(f.minX)),\(Int(f.minY))) size \(Int(f.width))x\(Int(f.height))")
                     cards[idx].tap()
                     continue
                 }
@@ -365,6 +357,25 @@ final class VerifyUITests: XCTestCase {
             if web.exists { web.swipeUp(velocity: .slow) } else { app.swipeUp(velocity: .slow) }
             sleep(1)
         }
+    }
+
+    /// Things that could be the open-file control, biggest first. Measured lessons, not guesses:
+    /// olmconverter's is a 320x47 bar at the BOTTOM of the screen (a "top two thirds" filter dropped
+    /// it) and m4brush's biggest button is 156x38 (an "area > 5000" floor dropped everything real).
+    /// And it is not always a button — a tappable card in a web view can report as plain text — so
+    /// non-buttons are candidates too, after every button has been tried.
+    private func openCandidates(_ app: XCUIApplication) -> [XCUIElement] {
+        let tabBarTop = app.tabBars.firstMatch.exists ? app.tabBars.firstMatch.frame.minY : .greatestFiniteMagnitude
+        func usable(_ e: XCUIElement) -> Bool {
+            guard e.exists, e.isHittable else { return false }
+            let f = e.frame
+            return f.width * f.height > 1200 && f.midY < tabBarTop
+        }
+        let area: (XCUIElement) -> CGFloat = { $0.frame.width * $0.frame.height }
+        let buttons = app.buttons.allElementsBoundByIndex.filter(usable).sorted { area($0) > area($1) }
+        let others = (app.otherElements.allElementsBoundByIndex + app.staticTexts.allElementsBoundByIndex)
+            .filter(usable).sorted { area($0) > area($1) }
+        return buttons + others
     }
 
     /// The right-most button on the anchor's row, right of the anchor (an icon-only button).
