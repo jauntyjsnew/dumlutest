@@ -226,6 +226,14 @@ final class VerifyUITests: XCTestCase {
             print("VERIFY-STATE picker tabs=\(pickerTabs.exists) fixtureCell=\(cell.exists) fixtureText=\(text.exists) "
                   + "onMyIPhoneTitle=\(app.navigationBars.staticTexts["On My iPhone"].exists) "
                   + "browseTab=\(app.tabBars.buttons["Browse"].exists) cells=\(app.cells.count) buttons=\(app.buttons.count)")
+            // Shapes only — where the tappable things are and whether they can be tapped at all.
+            // No labels and no text: this log is public. It is the only way to tell "the open control
+            // is not where we tap" from "the tap lands and the picker still never opens".
+            for b in app.buttons.allElementsBoundByIndex.prefix(10) {
+                let f = b.frame
+                print("VERIFY-STATE button at (\(Int(f.minX)),\(Int(f.minY))) size \(Int(f.width))x\(Int(f.height)) "
+                      + "hittable=\(b.isHittable) enabled=\(b.isEnabled)")
+            }
         }
         XCTAssertTrue(picked, "fixture \(name) found in Files › On My iPhone")
         // No trailing "Open" tap: the picker's own Open was handled inside the loop, and after the
