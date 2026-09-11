@@ -149,8 +149,14 @@ final class VerifyUITests: XCTestCase {
             // Only tap what is still on screen: a row that disappeared between the poll and the tap
             // makes XCUITest fail on the coordinate itself, which reads like a test error.
             if (cell.exists && cell.isHittable) || (text.exists && pickerTabs.exists) {
+                // One gesture does not open the file in every picker: a list row opens on a single
+                // tap, a grid tile only selects and needs Open, and some pickers want the thumbnail
+                // rather than the row's middle. Escalate across attempts instead of repeating the
+                // same tap ten times and calling the file missing.
                 if cell.exists && cell.isHittable {
-                    cell.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.25)).tap()
+                    let spot = cell.coordinate(withNormalizedOffset:
+                        CGVector(dx: 0.5, dy: attempt % 3 == 1 ? 0.5 : 0.25))
+                    if attempt % 3 == 2 { spot.doubleTap() } else { spot.tap() }
                 } else if text.exists {
                     text.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: -1.5)).tap()
                 }
@@ -257,7 +263,14 @@ final class VerifyUITests: XCTestCase {
                 target = rightmostButton(app, rowOf: target)
             }
             if optional {
-                if target.waitForExistence(timeout: 5) {
+                // 5 s was not enough for a step that only appears once the app has finished reading
+                // the file: it was skipped in silence, no job ever started, and the wait that follows
+                // then spent its whole budget on a screen that could never change. Say which way it
+                // went, so a failing run tells "skipped" apart from "tapped".
+                if !target.waitForExistence(timeout: 20) {
+                    print("VERIFY-STATE optional export step not on screen; skipped")
+                }
+                if target.exists {
                     bringIntoView(app, target)
                     // On screen but still not hittable (a footer button the scroll could not reach):
                     // tap it by coordinate anyway. Skipping it silently starts no job at all, and the
