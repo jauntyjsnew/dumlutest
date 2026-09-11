@@ -18,9 +18,11 @@
 #
 # ⛔ IT DOES NOT PUSH. A green run is a report; moving `main` stays a human decision.
 #
-# RATING_TARGETS format — one line per app, tab separated, `#` and blanks ignored:
+# RATING_TARGETS format — one line per app, tab separated, `#` and blanks ignored.
+# RATING_TARGETS_EXTRA holds later additions in the same format; an alias missing from the first is
+# looked up in the second, because a secret cannot be read back to be appended to.
 #   alias  owner/repo  branch  bundle-id  kind  home  file  ready  open_asks  export  onboard  fixture  [spec-b64]
-#     kind      generic | generic-spec | native:<AppTarget> | custom:step
+#     kind      generic | generic-spec | native:<AppTarget> | custom:<test file in this directory>
 #     fixture   repo:<path-in-repo>:<name>  |  gen:<mbox|gpx|xlsx|stl|zip|m4a|pdfpin>
 #
 # ADDITIVE BY CONSTRUCTION. Reads, imports and modifies no other workflow in this repository.
@@ -74,9 +76,13 @@ jobs:
         id: t
         env:
           TARGETS: ${{ secrets.RATING_TARGETS }}
+          TARGETS_EXTRA: ${{ secrets.RATING_TARGETS_EXTRA }}
           ALIAS: ${{ matrix.alias }}
         run: |
           line=$(printf '%s\n' "$TARGETS" | awk -F'\t' -v a="$ALIAS" '$1 == a {print; exit}')
+          # A second table, same format, for apps added later. A secret cannot be read back to be
+          # appended to, so adding one app must never mean rewriting the lines that already work.
+          [ -n "$line" ] || line=$(printf '%s\n' "$TARGETS_EXTRA" | awk -F'\t' -v a="$ALIAS" '$1 == a {print; exit}')
           [ -n "$line" ] || { echo "alias not in RATING_TARGETS"; exit 1; }
           i=0
           while IFS= read -r field; do
