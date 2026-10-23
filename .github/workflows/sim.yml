@@ -1,0 +1,110 @@
+# ─── sim — run a private repo's OWN simulator gate on a real Mac ─────────────────────────────
+#
+# WHY IT EXISTS. A change to an app is only proven when the app itself, built for the iOS
+# simulator, does the thing a customer does — open their file, see the result. The project keeps
+# that gate as a script of its own (default `tools/ci/sim/run.sh`); this workflow only gives it a
+# Mac, a private checkout, Node, and a place to put screenshots. The app's specifics (what to
+# build, which file to open, what to look for) live in the private repository, never here.
+#
+# ⛔ THIS REPOSITORY IS PUBLIC AND THE PROJECTS IT RUNS ARE NOT. Same contract as verify.yml:
+#   • Identity — `target` is read from the event payload (never `env:`, which the runner would
+#     print before anything could mask it) and `::add-mask::`ed at once. The dispatch INPUT
+#     itself is run metadata that log deletion does not reach: delete the run when done.
+#   • Content — the script writes every command's output to $OUT; the console gets only the
+#     script's own breadcrumbs and PASS/FAIL (a failure prints a bounded, path-scrubbed tail).
+#     $OUT is shredded at the end. Screenshots go up as a 1-day artifact — download, then delete
+#     the run.
+#
+# ⛔ NOTHING HERE TALKS TO APPLE: no signing, no App Store Connect, no APPLE_CREDENTIALS. It
+# builds for the simulator and runs XCUITest. The only secret read is GH_PAT (private checkout).
+#
+# ADDITIVE BY CONSTRUCTION. Reads, imports and modifies no other workflow in this repository.
+
+name: sim
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: 'owner/repo (masked in the log; delete the run afterwards)'
+        required: true
+        type: string
+      branch:
+        description: 'Branch'
+        required: false
+        type: string
+        default: 'main'
+      script:
+        description: "The project's gate script, relative to its root"
+        required: false
+        type: string
+        default: 'tools/ci/sim/run.sh'
+      failure_tail:
+        description: 'Lines of a failing gate to print (0 = print nothing)'
+        required: false
+        type: string
+        default: '60'
+
+permissions:
+  contents: read
+
+jobs:
+  sim:
+    runs-on: macos-latest
+    timeout-minutes: 120
+
+    steps:
+      # ⛔ The ONLY step that handles the repo name.
+      - name: Resolve target
+        id: t
+        run: |
+          set -euo pipefail
+          REPO="$(jq -r '.inputs.target // ""' "$GITHUB_EVENT_PATH")"
+          BRANCH="$(jq -r '.inputs.branch // "main"' "$GITHUB_EVENT_PATH")"
+          [[ "$REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || { echo "::error::target must be owner/repo"; exit 1; }
+          echo "::add-mask::$REPO"
+          echo "::add-mask::${REPO#*/}"
+          if [ "${#BRANCH}" -ge 5 ]; then echo "::add-mask::$BRANCH"; fi
+          {
+            echo "repo=$REPO"
+            echo "branch=$BRANCH"
+          } >> "$GITHUB_OUTPUT"
+          echo "target resolved"
+
+      - name: Check out the project (private)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ steps.t.outputs.repo }}
+          ref: ${{ steps.t.outputs.branch }}
+          token: ${{ secrets.GH_PAT }}
+          path: app
+
+      - name: Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Gate
+        env:
+          OUT: ${{ runner.temp }}/sim.log
+          ART: ${{ runner.temp }}/sim-art
+          FAIL_TAIL: ${{ inputs.failure_tail }}
+          GATE: ${{ inputs.script }}
+        run: |
+          set -uo pipefail
+          case "$GATE" in /*|*..*) echo "::error::script must be a path inside the project"; exit 1 ;; esac
+          [ -f "app/$GATE" ] || { echo "::error::gate script not found in the project"; exit 1; }
+          bash "app/$GATE"
+
+      - name: Screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sim-screenshots
+          path: ${{ runner.temp }}/sim-art
+          if-no-files-found: ignore
+          retention-days: 1
+
+      - name: Shred captured output
+        if: always()
+        run: rm -rf "${{ runner.temp }}/sim.log" "${{ runner.temp }}/dd" "${{ runner.temp }}/sim.xcresult" || true
