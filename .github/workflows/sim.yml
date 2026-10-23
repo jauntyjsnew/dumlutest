@@ -78,6 +78,9 @@ jobs:
           ref: ${{ steps.t.outputs.branch }}
           token: ${{ secrets.GH_PAT }}
           path: app
+          # Never leave the token in app/.git/config: the gate runs the project's own build
+          # scripts, and nothing after checkout needs git credentials.
+          persist-credentials: false
 
       - name: Node
         uses: actions/setup-node@v4
