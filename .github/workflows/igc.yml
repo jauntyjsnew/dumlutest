@@ -271,6 +271,30 @@ jobs:
             npm install --legacy-peer-deps
           fi
       
+      - name: Runner Image
+        id: image
+        # Cargo önbelleği runner imajına bağlı: başka imajın ~/.cargo/bin'i geri yüklenmesin.
+        run: echo "v=${ImageOS:-mac}-${ImageVersion:-0}" >> "$GITHUB_OUTPUT"
+      
+      - name: Rust Layout
+        # ⛔ GitHub'ın macOS imajı 20261021'den beri rustup'ı YALNIZ Homebrew'den
+        #    kuruyor (actions/runner-images#14990): ~/.cargo ve ~/.cargo/env YOK,
+        #    rustc/cargo /opt/homebrew/opt/rustup/bin'de. Olmayan ~/.cargo/env'i
+        #    `source` etmek macOS bash'ini SESSİZCE öldürüyordu (exit 1, `|| true`
+        #    yakalamıyor): Rust motorlu her app Rust adımında duruyordu. App build
+        #    betikleri de cargo'yu ~/.cargo/bin'de arıyor. Eski düzeni kur.
+        run: |
+          RB="$(brew --prefix rustup 2>/dev/null || true)/bin"
+          if [ ! -e "$HOME/.cargo/bin/cargo" ] && [ -x "$RB/cargo" ]; then
+            mkdir -p "$HOME/.cargo/bin"
+            for t in "$RB"/*; do ln -sf "$t" "$HOME/.cargo/bin/"; done
+            echo "~/.cargo/bin → $RB"
+          fi
+          if [ ! -f "$HOME/.cargo/env" ]; then
+            mkdir -p "$HOME/.cargo"
+            echo 'case ":${PATH}:" in *:"$HOME/.cargo/bin":*) ;; *) export PATH="$HOME/.cargo/bin:$PATH" ;; esac' > "$HOME/.cargo/env"
+          fi
+      
       - name: Cargo Cache
         if: steps.features.outputs.has_rust == 'true'
         uses: actions/cache@v4
@@ -281,26 +305,33 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             app/${{ steps.features.outputs.rust_engine_dir }}/target
-          key: cargo-${{ runner.os }}-${{ hashFiles('app/**/Cargo.lock', 'app/**/Cargo.toml') }}
-          restore-keys: cargo-${{ runner.os }}-
+          key: cargo-${{ runner.os }}-${{ steps.image.outputs.v }}-${{ hashFiles('app/**/Cargo.lock', 'app/**/Cargo.toml') }}
+          restore-keys: cargo-${{ runner.os }}-${{ steps.image.outputs.v }}-
       
       - name: Rust
         if: steps.features.outputs.has_rust == 'true'
         run: |
-          if command -v rustc &>/dev/null && command -v wasm-pack &>/dev/null; then
-            rustc --version
-            wasm-pack --version
-          else
+          if ! command -v rustc &>/dev/null; then
             curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-            source $HOME/.cargo/env
-            cargo install wasm-pack
           fi
+          if [ -f "$HOME/.cargo/env" ]; then . "$HOME/.cargo/env"; fi
+          # rustc çalışmıyorsa sessizce düşme: ne gördüğünü yaz, toolchain'i onar.
+          if ! rustc --version; then
+            echo "::warning::rustc bu runner'da çalışmadı (${ImageOS:-?} ${ImageVersion:-?}) — Rust toolchain yeniden kuruluyor"
+            ls -la "$HOME/.cargo/bin" 2>&1 | head -20 || true
+            rustup show 2>&1 | head -20 || true
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path
+            if [ -f "$HOME/.cargo/env" ]; then . "$HOME/.cargo/env"; fi
+            rustc --version
+          fi
+          command -v wasm-pack &>/dev/null || cargo install wasm-pack
+          wasm-pack --version
 
       - name: WASM
         if: steps.features.outputs.has_rust == 'true'
         working-directory: app
         run: |
-          source $HOME/.cargo/env
+          if [ -f "$HOME/.cargo/env" ]; then . "$HOME/.cargo/env"; fi
           RUST_DIR="${{ steps.features.outputs.rust_engine_dir }}"
           WASM_OUT="${{ steps.features.outputs.wasm_out_dir }}"
           if [ -f "$RUST_DIR/Makefile" ]; then
