@@ -1123,6 +1123,8 @@ jobs:
                 <true/>
                 <key>com.apple.security.files.user-selected.read-write</key>
                 <true/>
+                <key>com.apple.security.print</key>
+                <true/>
               </dict>
               </plist>
               EOF
@@ -1144,6 +1146,9 @@ jobs:
                 # Drop a stale read-only key first: a leftover one is what AppKit sees.
                 /usr/libexec/PlistBuddy -c "Delete :com.apple.security.files.user-selected.read-only" "App/App.entitlements" 2>/dev/null || true
                 /usr/libexec/PlistBuddy -c "Add :com.apple.security.files.user-selected.read-write bool true" "App/App.entitlements" 2>/dev/null || /usr/libexec/PlistBuddy -c "Set :com.apple.security.files.user-selected.read-write true" "App/App.entitlements"
+                # Printing: a sandboxed Mac app without com.apple.security.print gets "This application does not
+                # support printing" instead of the print panel (measured 2026-10-28 on the CI Mac).
+                /usr/libexec/PlistBuddy -c "Add :com.apple.security.print bool true" "App/App.entitlements" 2>/dev/null || /usr/libexec/PlistBuddy -c "Set :com.apple.security.print true" "App/App.entitlements"
               fi
               
               cat <<EOF > link_entitlements.rb
