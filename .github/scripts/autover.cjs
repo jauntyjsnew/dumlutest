@@ -273,6 +273,10 @@ async function main() {
 
   if (!info.versions.length) return fail('the app exists but has no versions yet — create the first version in App Store Connect.');
 
+  // ⛔ PUBLIC logs: the App Store name is not the capacitor appName the workflows mask, so
+  //    mask it here, before it is printed (the runner hides the ::add-mask:: line itself and
+  //    every later occurrence in the job).
+  if (info.appName && process.env.GITHUB_ACTIONS) console.log('::add-mask::' + info.appName);
   console.log('App: ' + (info.appName || '?') + '  (' + bundleId + ')');
   console.log('Versions in App Store Connect:');
   for (const v of [...info.versions].sort((a, b) => cmpVersion(b.versionString, a.versionString))) {
