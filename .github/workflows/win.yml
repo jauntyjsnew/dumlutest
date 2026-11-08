@@ -63,6 +63,44 @@ on:
         type: string
         default: 'public.app-category.utilities'
 
+  # winall.yml calls this workflow once per platform (iphone_and_ipad, macos_only) in ONE
+  # dispatch, with the version resolved once for both. Same inputs as the dispatch above;
+  # the secrets come from the caller (secrets: inherit). A dispatch of win.yml itself works
+  # exactly as before.
+  workflow_call:
+    inputs:
+      repository_url:
+        required: true
+        type: string
+      repository_branch:
+        required: false
+        type: string
+        default: 'main'
+      version:
+        required: false
+        type: string
+        default: ''
+      target_platform:
+        required: true
+        type: string
+      build_mode:
+        required: true
+        type: string
+      npm_build_command:
+        required: false
+        type: string
+        default: 'npm run build'
+      provisioning_profile_base64:
+        required: false
+        type: string
+      mac_provisioning_profile_base64:
+        required: false
+        type: string
+      mac_category:
+        required: false
+        type: string
+        default: 'public.app-category.utilities'
+
 
 jobs:
   build:
@@ -82,14 +120,16 @@ jobs:
       # "Mac Exclude ShareExt" step strips it, but it runs before Build App, so
       # on all_devices it would strip the extension out of the iOS archive too.
       # MacExportOptions.plist correspondingly maps only the app's own bundle id.
-      # Both are fine for the way this workflow is actually used - one dispatch
-      # for iOS, a second for macos_only - and all_devices has never been run
-      # here. Rather than leave that path to fail deep inside exportArchive with
-      # a missing-profile error, say so up front.
+      # Both are fine for the way this workflow is actually used - one run for
+      # iOS, one for macos_only - and all_devices has never been run here.
+      # winall.yml makes those two runs ONE dispatch: it resolves the version
+      # once and calls this workflow for each platform on its own runner.
+      # Rather than leave all_devices to fail deep inside exportArchive with a
+      # missing-profile error, say so up front.
       - name: Reject all_devices
         if: inputs.target_platform == 'all_devices'
         run: |
-          echo "::error::win.yml cannot build iOS and Mac in one run, because the ShareExt extension has to be stripped for the Mac leg and that would remove it from the iOS archive as well. Dispatch twice: once with iphone_and_ipad, once with macos_only."
+          echo "::error::win.yml cannot build iOS and Mac in one run, because the ShareExt extension has to be stripped for the Mac leg and that would remove it from the iOS archive as well. Dispatch winall.yml (both platforms in one dispatch, one version), or win.yml twice: once with iphone_and_ipad, once with macos_only."
           exit 1
 
       - name: Parse
@@ -1356,7 +1396,7 @@ jobs:
         if: inputs.build_mode == 'build_only' && inputs.target_platform != 'all_devices'
         uses: actions/upload-artifact@v4
         with:
-          name: app-${{ github.run_number }}
+          name: app-${{ github.run_number }}-${{ inputs.target_platform }}
           path: app/ios/App/${{ env.APP_NAME_SAFE }}.app.zip
           retention-days: 1
       
@@ -1390,7 +1430,7 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: e-${{ github.run_number }}
+          name: e-${{ github.run_number }}-${{ inputs.target_platform }}
           path: ${{ env.error_summary_path }}
           retention-days: 1
           if-no-files-found: ignore
@@ -1399,7 +1439,7 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: l-${{ github.run_number }}
+          name: l-${{ github.run_number }}-${{ inputs.target_platform }}
           path: |
             app/ios/App/build*/**/*.log
             app/ios/App/*.log

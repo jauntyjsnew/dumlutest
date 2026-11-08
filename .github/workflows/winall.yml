@@ -1,0 +1,198 @@
+# ─── winall — win.yml's iOS and Mac legs in ONE dispatch, at ONE version ─────────────────────
+#
+# WHY. win.yml builds the app that ships a share extension. Its Mac leg strips the extension
+# from the Xcode project before it builds, so one job cannot build both platforms (the iOS
+# archive would lose the extension too) and win.yml refuses all_devices. Two dispatches cost
+# something else: each one resolved its own version from App Store Connect, so the two builds
+# drifted apart (iOS went to the next version while the Mac reused an older open record).
+#
+# WHAT. One small job resolves the version ONCE, with the same autover.cjs and the same rule
+# win.yml uses, over every platform this dispatch uploads to. Then win.yml runs per platform
+# on its own runner, in parallel and unchanged, with that version:
+#   all_devices      → iphone_and_ipad + macos_only
+#   iphone_and_ipad  → the iOS leg only
+#   macos_only       → the Mac leg only
+# A failed leg can be re-run alone ("Re-run failed jobs"); it keeps this run's version.
+#
+# ⛔ PUBLIC REPOSITORY. In the version job the target repo, its bundle id and its name are
+#   masked before anything prints: the repo is read from the event payload, never put into a
+#   script or an env: block (the log shows those before any mask exists).
+
+name: WinDat-all
+
+on:
+  workflow_dispatch:
+    inputs:
+      repository_url:
+        description: 'owner/repo'
+        required: true
+        type: string
+      repository_branch:
+        description: 'Branch'
+        required: false
+        type: string
+        default: 'main'
+      version:
+        description: 'Version — leave EMPTY to take it from App Store Connect (once, for both platforms)'
+        required: false
+        type: string
+        default: ''
+      target_platform:
+        description: 'Target'
+        required: true
+        type: choice
+        options:
+          - all_devices
+          - iphone_and_ipad
+          - macos_only
+        default: 'all_devices'
+      build_mode:
+        description: 'Mode'
+        required: true
+        type: choice
+        options:
+          - build_only
+          - publish_to_appstore
+        default: 'build_only'
+      npm_build_command:
+        description: 'Build cmd'
+        required: false
+        type: string
+        default: 'npm run build'
+      provisioning_profile_base64:
+        description: 'iOS profile base64'
+        required: false
+        type: string
+      mac_provisioning_profile_base64:
+        description: 'Mac profile base64'
+        required: false
+        type: string
+      mac_category:
+        description: 'Mac category UTI'
+        required: false
+        type: string
+        default: 'public.app-category.utilities'
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.autover.outputs.version }}
+    steps:
+      # ⛔ The only step that reads the repo name: from the event payload, masked at once.
+      - name: Target
+        id: t
+        run: |
+          set -euo pipefail
+          REPO="$(jq -r '.inputs.repository_url // ""' "$GITHUB_EVENT_PATH")"
+          BRANCH="$(jq -r '.inputs.repository_branch // ""' "$GITHUB_EVENT_PATH")"
+          [[ "$REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || { echo "::error::repository_url must be owner/repo"; exit 1; }
+          echo "::add-mask::$REPO"
+          echo "::add-mask::${REPO#*/}"
+          {
+            echo "repo=$REPO"
+            echo "branch=${BRANCH:-main}"
+          } >> "$GITHUB_OUTPUT"
+          echo "target resolved"
+
+      - name: App Store Connect key
+        id: apple
+        env:
+          APPLE_CREDS: ${{ secrets.APPLE_CREDENTIALS }}
+        run: |
+          set -euo pipefail
+          KEY_ID=$(echo "$APPLE_CREDS" | jq -r '.api_key_id')
+          ISSUER=$(echo "$APPLE_CREDS" | jq -r '.api_issuer_id')
+          KEY_B64=$(echo "$APPLE_CREDS" | jq -r '.api_key_base64')
+          echo "::add-mask::$KEY_ID"
+          echo "::add-mask::$ISSUER"
+          echo "::add-mask::$KEY_B64"
+          {
+            echo "api_key_id=$KEY_ID"
+            echo "api_issuer_id=$ISSUER"
+            echo "api_key_base64=$KEY_B64"
+          } >> "$GITHUB_OUTPUT"
+
+      # The bundle id exactly as win.yml's Config step reads it, without checking the app out.
+      - name: Bundle id
+        id: app
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+          REPO: ${{ steps.t.outputs.repo }}
+          BRANCH: ${{ steps.t.outputs.branch }}
+        run: |
+          set -uo pipefail
+          get() { gh api "repos/$REPO/contents/$1?ref=$BRANCH" --jq .content 2>/dev/null | base64 -d 2>/dev/null; }
+          APP_ID=""; APP_NAME=""
+          CFG="$(get capacitor.config.json || true)"
+          if [ -n "$CFG" ]; then
+            APP_ID=$(printf '%s' "$CFG" | jq -r '.appId // empty')
+            APP_NAME=$(printf '%s' "$CFG" | jq -r '.appName // empty')
+          else
+            CFG="$(get capacitor.config.ts || true)"
+            APP_ID=$(printf '%s\n' "$CFG" | sed -n "s/.*appId:[[:space:]]*['\"]\\([^'\"]*\\)['\"].*/\\1/p" | head -1)
+            APP_NAME=$(printf '%s\n' "$CFG" | sed -n "s/.*appName:[[:space:]]*['\"]\\([^'\"]*\\)['\"].*/\\1/p" | head -1)
+          fi
+          if [ -z "$APP_ID" ]; then echo "::error::the app's capacitor config could not be read (no appId)"; exit 1; fi
+          echo "::add-mask::$APP_ID"
+          if [ -n "$APP_NAME" ]; then echo "::add-mask::$APP_NAME"; fi
+          echo "bundle_id=$APP_ID" >> "$GITHUB_OUTPUT"
+          echo "bundle id read"
+
+      - name: Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Version script
+        uses: actions/checkout@v4
+        with:
+          path: .wf
+          persist-credentials: false
+
+      # Same script, same rule as win.yml's Auto Version: filled "version" input wins; otherwise
+      # the highest version across iOS + macOS, reused while open on every platform it uploads
+      # to, else the next one. Run once here, so both legs get the same number.
+      - name: Version
+        id: autover
+        env:
+          ASC_KEY_ID: ${{ steps.apple.outputs.api_key_id }}
+          ASC_ISSUER_ID: ${{ steps.apple.outputs.api_issuer_id }}
+          ASC_KEY_B64: ${{ steps.apple.outputs.api_key_base64 }}
+          BUNDLE_ID: ${{ steps.app.outputs.bundle_id }}
+          MANUAL_VERSION: ${{ inputs.version }}
+          BUILD_MODE: ${{ inputs.build_mode }}
+          TARGET_PLATFORM: ${{ inputs.target_platform }}
+        run: node "$GITHUB_WORKSPACE/.wf/.github/scripts/autover.cjs"
+
+  ios:
+    needs: version
+    if: inputs.target_platform != 'macos_only'
+    uses: ./.github/workflows/win.yml
+    secrets: inherit
+    with:
+      repository_url: ${{ inputs.repository_url }}
+      repository_branch: ${{ inputs.repository_branch }}
+      version: ${{ needs.version.outputs.version }}
+      target_platform: iphone_and_ipad
+      build_mode: ${{ inputs.build_mode }}
+      npm_build_command: ${{ inputs.npm_build_command }}
+      provisioning_profile_base64: ${{ inputs.provisioning_profile_base64 }}
+      mac_provisioning_profile_base64: ${{ inputs.mac_provisioning_profile_base64 }}
+      mac_category: ${{ inputs.mac_category }}
+
+  mac:
+    needs: version
+    if: inputs.target_platform != 'iphone_and_ipad'
+    uses: ./.github/workflows/win.yml
+    secrets: inherit
+    with:
+      repository_url: ${{ inputs.repository_url }}
+      repository_branch: ${{ inputs.repository_branch }}
+      version: ${{ needs.version.outputs.version }}
+      target_platform: macos_only
+      build_mode: ${{ inputs.build_mode }}
+      npm_build_command: ${{ inputs.npm_build_command }}
+      provisioning_profile_base64: ${{ inputs.provisioning_profile_base64 }}
+      mac_provisioning_profile_base64: ${{ inputs.mac_provisioning_profile_base64 }}
+      mac_category: ${{ inputs.mac_category }}
